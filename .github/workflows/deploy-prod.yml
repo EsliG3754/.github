@@ -300,8 +300,14 @@ jobs:
             }
           fi
 
-          # --no-deps + --remove-orphans dentro del project: defensa explícita
-          docker compose -f "${COMPOSE_FILE}" up -d --no-deps --remove-orphans "${SERVICE}"
+          # Flags clave:
+          # --no-deps: NUNCA recrea otros services del compose (defensa explícita).
+          # --remove-orphans: limpia containers del MISMO project que ya no están en el compose.
+          # --force-recreate: fuerza recreación del service aunque el config no haya cambiado.
+          #   Necesario porque sin él, si un container previo entró en restart loop y quedó
+          #   ocupando puerto del host (ej kario:127.0.0.1:3004), el up nuevo falla con
+          #   "port is already allocated". --force-recreate lo detiene primero.
+          docker compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate --remove-orphans "${SERVICE}"
 
           if [ "${WAIT_GRACE_PERIOD}" -gt 0 ]; then
             echo "Grace period inicial: ${WAIT_GRACE_PERIOD}s antes del primer check..."
