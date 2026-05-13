@@ -78,6 +78,16 @@ on:
         required: false
         default: true
         type: boolean
+      wait_max_seconds:
+        description: "Tiempo máximo a esperar a que el container llegue a healthy (segundos)"
+        required: false
+        default: 90
+        type: number
+      wait_grace_period_seconds:
+        description: "Espera inicial antes del primer check de healthy (segundos)"
+        required: false
+        default: 0
+        type: number
       timeout_minutes_build:
         description: "Timeout del job de build (minutos)"
         required: false
@@ -258,6 +268,8 @@ jobs:
           COMPOSE_FILE: ${{ inputs.compose_file }}
           CHECK_NETWORK: ${{ inputs.check_hubwell_network }}
           RUN_MIGRATIONS: ${{ inputs.run_migrations }}
+          WAIT_MAX_SECONDS: ${{ inputs.wait_max_seconds }}
+          WAIT_GRACE_PERIOD: ${{ inputs.wait_grace_period_seconds }}
         run: |
           ssh "$USER@$HOST" bash -se <<EOF
           set -euo pipefail
@@ -291,16 +303,26 @@ jobs:
           # --no-deps + --remove-orphans dentro del project: defensa explícita
           docker compose -f "${COMPOSE_FILE}" up -d --no-deps --remove-orphans "${SERVICE}"
 
-          for i in \$(seq 1 30); do
+          if [ "${WAIT_GRACE_PERIOD}" -gt 0 ]; then
+            echo "Grace period inicial: ${WAIT_GRACE_PERIOD}s antes del primer check..."
+            sleep "${WAIT_GRACE_PERIOD}"
+          fi
+
+          MAX_ITER=\$(( ${WAIT_MAX_SECONDS} / 3 ))
+          for i in \$(seq 1 \$MAX_ITER); do
             state=\$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo "missing")
             health=\$(docker inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "no-healthcheck")
-            echo "wait[\$i] state=\$state health=\$health"
+            echo "wait[\$i/\$MAX_ITER] state=\$state health=\$health"
             if [ "\$state" = "running" ] && { [ "\$health" = "healthy" ] || [ "\$health" = "no-healthcheck" ]; }; then
+              echo "✅ Container ${CONTAINER} healthy"
               break
             fi
-            if [ "\$i" -eq 30 ]; then
-              echo "::error::Container ${CONTAINER} no llegó a healthy en 90s"
-              docker compose -f "${COMPOSE_FILE}" logs --tail=100 "${SERVICE}"
+            if [ "\$i" -eq "\$MAX_ITER" ]; then
+              echo "::error::Container ${CONTAINER} no llegó a healthy en ${WAIT_MAX_SECONDS}s"
+              echo "--- docker ps --filter name=${CONTAINER} ---"
+              docker ps -a --filter "name=${CONTAINER}" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.RunningFor}}'
+              echo "--- docker compose logs --tail=200 ---"
+              docker compose -f "${COMPOSE_FILE}" logs --tail=200 "${SERVICE}"
               exit 1
             fi
             sleep 3
