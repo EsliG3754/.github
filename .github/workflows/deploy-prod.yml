@@ -43,11 +43,31 @@ on:
         required: false
         default: "."
         type: string
+      compose_file:
+        description: "Path al compose file (relativo al repo y al vps_path). Default: compose.prod.yml"
+        required: false
+        default: "compose.prod.yml"
+        type: string
       check_hubwell_network:
         description: "Verificar que la red hubwell_network exista en el VPS"
         required: false
         default: true
         type: boolean
+      smoke_test_mode:
+        description: "Modo de smoke test post-deploy: 'public' (curl al health_url), 'internal' (docker run en network interna), 'none'"
+        required: false
+        default: "public"
+        type: string
+      smoke_internal_url:
+        description: "Cuando smoke_test_mode=internal, URL HTTP a probar desde la red docker (ej http://kario:3004/health)"
+        required: false
+        default: ""
+        type: string
+      smoke_internal_network:
+        description: "Nombre de red docker para smoke interno"
+        required: false
+        default: "hubwell_network"
+        type: string
       run_migrations:
         description: "Ejecutar prisma migrate deploy antes del up"
         required: false
@@ -187,14 +207,16 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Sincronizar compose.prod.yml al VPS
+      - name: Sincronizar compose file al VPS
         env:
           HOST: ${{ secrets.PROD_HOST }}
           USER: ${{ secrets.PROD_USER }}
           VPS_PATH: ${{ inputs.vps_path }}
+          COMPOSE_FILE: ${{ inputs.compose_file }}
         run: |
-          ssh "$USER@$HOST" "mkdir -p $VPS_PATH"
-          scp compose.prod.yml "$USER@$HOST:$VPS_PATH/compose.prod.yml"
+          REMOTE_DIR="$VPS_PATH/$(dirname "$COMPOSE_FILE")"
+          ssh "$USER@$HOST" "mkdir -p '$REMOTE_DIR'"
+          scp "$COMPOSE_FILE" "$USER@$HOST:$VPS_PATH/$COMPOSE_FILE"
 
       - name: Backup DB pre-migrate (opcional)
         if: ${{ inputs.run_migrations && inputs.backup_before_migrate }}
@@ -233,6 +255,7 @@ jobs:
           SERVICE: ${{ inputs.service_name }}
           CONTAINER: ${{ inputs.container_name }}
           VPS_PATH: ${{ inputs.vps_path }}
+          COMPOSE_FILE: ${{ inputs.compose_file }}
           CHECK_NETWORK: ${{ inputs.check_hubwell_network }}
           RUN_MIGRATIONS: ${{ inputs.run_migrations }}
         run: |
@@ -255,18 +278,18 @@ jobs:
           echo "${GHCR_PULL_TOKEN}" | docker login ghcr.io -u "${GHCR_PULL_USER}" --password-stdin
 
           export ${VERSION_ENV_VAR}="${VERSION}"
-          docker compose -f compose.prod.yml pull "${SERVICE}"
+          docker compose -f "${COMPOSE_FILE}" pull "${SERVICE}"
 
           if [ "${RUN_MIGRATIONS}" = "true" ]; then
             echo "▶ Ejecutando prisma migrate deploy..."
-            docker compose -f compose.prod.yml run --rm "${SERVICE}" npx prisma migrate deploy || {
+            docker compose -f "${COMPOSE_FILE}" run --rm "${SERVICE}" npx prisma migrate deploy || {
               echo "::error::Migrate falló. NO se subirá la nueva imagen. Revisa backup en /srv/backups/."
               exit 1
             }
           fi
 
           # --no-deps + --remove-orphans dentro del project: defensa explícita
-          docker compose -f compose.prod.yml up -d --no-deps --remove-orphans "${SERVICE}"
+          docker compose -f "${COMPOSE_FILE}" up -d --no-deps --remove-orphans "${SERVICE}"
 
           for i in \$(seq 1 30); do
             state=\$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo "missing")
@@ -277,7 +300,7 @@ jobs:
             fi
             if [ "\$i" -eq 30 ]; then
               echo "::error::Container ${CONTAINER} no llegó a healthy en 90s"
-              docker compose -f compose.prod.yml logs --tail=100 "${SERVICE}"
+              docker compose -f "${COMPOSE_FILE}" logs --tail=100 "${SERVICE}"
               exit 1
             fi
             sleep 3
@@ -286,7 +309,8 @@ jobs:
           docker image prune -f
           EOF
 
-      - name: Smoke test post-deploy
+      - name: Smoke test público
+        if: ${{ inputs.smoke_test_mode == 'public' }}
         env:
           HEALTH_URL: ${{ inputs.health_url }}
         run: |
@@ -301,6 +325,20 @@ jobs:
           done
           echo "::error::$HEALTH_URL no responde con 2xx/3xx tras el deploy"
           exit 1
+
+      - name: Smoke test interno (red docker)
+        if: ${{ inputs.smoke_test_mode == 'internal' }}
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          INTERNAL_URL: ${{ inputs.smoke_internal_url }}
+          NETWORK: ${{ inputs.smoke_internal_network }}
+        run: |
+          if [ -z "$INTERNAL_URL" ]; then
+            echo "::error::smoke_test_mode=internal requiere smoke_internal_url"
+            exit 1
+          fi
+          ssh "$USER@$HOST" "docker run --rm --network $NETWORK curlimages/curl:8.9.1 -fsS '$INTERNAL_URL'"
 
       - name: Resumen
         if: always()
