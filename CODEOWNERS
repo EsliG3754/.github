@@ -1,0 +1,15 @@
+# CODEOWNERS — default org-wide
+# Cada repo puede sobreescribirlo en su propio .github/CODEOWNERS
+
+# Por defecto, el owner aprueba todo
+*       @EsliG3754
+
+# Cosas críticas requieren atención del owner explícita
+/.github/                @EsliG3754
+/prisma/                 @EsliG3754
+/migrations/             @EsliG3754
+/docker/                 @EsliG3754
+/Dockerfile              @EsliG3754
+/compose.prod.yml        @EsliG3754
+/deploy/                 @EsliG3754
+*.env*                   @EsliG3754
