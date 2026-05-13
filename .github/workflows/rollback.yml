@@ -1,0 +1,194 @@
+name: rollback (reusable)
+
+# Redespliega una versión PREVIA sin rebuild. Usa la imagen ya existente en
+# GHCR y solo hace pull + up del servicio. Cero downtime.
+#
+# IMPORTANTE: este rollback NO revierte migraciones de DB. Si rompió por
+# schema, hay que ejecutar la migración inversa o restaurar desde backup
+# (ver OPS.md §3.2).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Versión a desplegar. 'latest' = última, o un tag inmutable como '20260513-184500-abc1234'."
+        required: true
+        type: string
+      image_name:
+        description: "Nombre de la imagen GHCR"
+        required: true
+        type: string
+      vps_path:
+        description: "Ruta absoluta del stack en el VPS"
+        required: true
+        type: string
+      service_name:
+        description: "Nombre del servicio en compose.prod.yml"
+        required: false
+        default: "web"
+        type: string
+      container_name:
+        description: "container_name del servicio"
+        required: true
+        type: string
+      version_env_var:
+        description: "Nombre de la env var que compose espera (WEB_VERSION, PORTAL_VERSION, etc.)"
+        required: true
+        type: string
+      health_url:
+        description: "URL pública para smoke test"
+        required: true
+        type: string
+      environment_name:
+        description: "Nombre del environment en GitHub (default: production)"
+        required: false
+        default: "production"
+        type: string
+    secrets:
+      PROD_SSH_KEY:
+        required: true
+      PROD_HOST:
+        required: true
+      PROD_USER:
+        required: true
+      GHCR_PULL_USER:
+        required: true
+      GHCR_PULL_TOKEN:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    name: Rollback → ${{ inputs.health_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: ${{ inputs.environment_name }}
+      url: ${{ inputs.health_url }}
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar SSH
+        env:
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull versión + reiniciar SOLO ${{ inputs.service_name }}
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          VERSION_ENV_VAR: ${{ inputs.version_env_var }}
+          SERVICE: ${{ inputs.service_name }}
+          CONTAINER: ${{ inputs.container_name }}
+          VPS_PATH: ${{ inputs.vps_path }}
+        run: |
+          ssh "$USER@$HOST" bash -se <<EOF
+          set -euo pipefail
+          cd "${VPS_PATH}"
+
+          if [ ! -f .env ]; then
+            echo "::error::Falta ${VPS_PATH}/.env"; exit 1
+          fi
+
+          echo "${GHCR_PULL_TOKEN}" | docker login ghcr.io -u "${GHCR_PULL_USER}" --password-stdin
+
+          export ${VERSION_ENV_VAR}="${VERSION}"
+          docker compose -f compose.prod.yml pull "${SERVICE}"
+          docker compose -f compose.prod.yml up -d --no-deps --remove-orphans "${SERVICE}"
+
+          for i in \$(seq 1 30); do
+            state=\$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo "missing")
+            health=\$(docker inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "no-healthcheck")
+            echo "wait[\$i] state=\$state health=\$health"
+            if [ "\$state" = "running" ] && { [ "\$health" = "healthy" ] || [ "\$health" = "no-healthcheck" ]; }; then
+              break
+            fi
+            if [ "\$i" -eq 30 ]; then
+              echo "::error::Container ${CONTAINER} no llegó a healthy en 90s tras rollback"
+              docker compose -f compose.prod.yml logs --tail=100 "${SERVICE}"
+              exit 1
+            fi
+            sleep 3
+          done
+          EOF
+
+      - name: Smoke test post-rollback
+        env:
+          HEALTH_URL: ${{ inputs.health_url }}
+        run: |
+          set -e
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -fsS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            if echo "$code" | grep -q "^[23]"; then
+              echo "✅ $HEALTH_URL OK (HTTP $code)"; exit 0
+            fi
+            echo "intento $i: HTTP $code, reintentando..."
+            sleep 10
+          done
+          echo "::error::$HEALTH_URL no responde con 2xx/3xx tras rollback"
+          exit 1
+
+      - name: Resumen
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+          VERSION: ${{ inputs.version }}
+          HEALTH: ${{ inputs.health_url }}
+        run: |
+          echo "## Rollback summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: $HEALTH" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Notificar Telegram
+    needs: rollback
+    if: always() && (success() || failure())
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram message
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ needs.rollback.result }}
+          VERSION: ${{ inputs.version }}
+          IMAGE: ${{ inputs.image_name }}
+          HEALTH: ${{ inputs.health_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -e
+          if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+            echo "Telegram secrets no configurados, skip notificación."
+            exit 0
+          fi
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="↩️"
+            STATUS_TEXT="✅ success"
+          else
+            EMOJI="🔥"
+            STATUS_TEXT="❌ failed"
+          fi
+          MSG="$EMOJI *Rollback ${IMAGE} → ${VERSION}*%0A%0A*URL*: ${HEALTH}%0A*Status*: ${STATUS_TEXT}%0A*Por*: @${ACTOR}%0A%0A[Ver run](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+          curl -fsS "https://api.telegram.org/bot${BOT}/sendMessage" \
+            -d "chat_id=${CHAT}" \
+            -d "parse_mode=Markdown" \
+            -d "text=${MSG}" > /dev/null

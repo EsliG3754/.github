@@ -1,0 +1,354 @@
+name: deploy-prod (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Nombre de la imagen GHCR (ej: logwellv2, hubwell-portal, hubwell-api, kario)"
+        required: true
+        type: string
+      vps_path:
+        description: "Ruta absoluta del stack en el VPS (ej: /srv/logwellv2)"
+        required: true
+        type: string
+      service_name:
+        description: "Nombre del servicio en compose.prod.yml (ej: web, portal, api)"
+        required: false
+        default: "web"
+        type: string
+      container_name:
+        description: "container_name del servicio (ej: logwellv2_prod)"
+        required: true
+        type: string
+      version_env_var:
+        description: "Nombre de la env var que compose espera (ej: WEB_VERSION, PORTAL_VERSION)"
+        required: true
+        type: string
+      health_url:
+        description: "URL pública para smoke test (ej: https://logwell.mx)"
+        required: true
+        type: string
+      environment_name:
+        description: "Nombre del environment en GitHub (default: production)"
+        required: false
+        default: "production"
+        type: string
+      dockerfile:
+        description: "Path al Dockerfile (default: Dockerfile)"
+        required: false
+        default: "Dockerfile"
+        type: string
+      docker_context:
+        description: "Build context (default: .)"
+        required: false
+        default: "."
+        type: string
+      check_hubwell_network:
+        description: "Verificar que la red hubwell_network exista en el VPS"
+        required: false
+        default: true
+        type: boolean
+      run_migrations:
+        description: "Ejecutar prisma migrate deploy antes del up"
+        required: false
+        default: false
+        type: boolean
+      backup_before_migrate:
+        description: "Hacer pg_dump antes de migrate (requiere run_migrations=true)"
+        required: false
+        default: true
+        type: boolean
+      timeout_minutes_build:
+        description: "Timeout del job de build (minutos)"
+        required: false
+        default: 25
+        type: number
+      timeout_minutes_deploy:
+        description: "Timeout del job de deploy (minutos)"
+        required: false
+        default: 15
+        type: number
+    secrets:
+      PROD_SSH_KEY:
+        required: true
+      PROD_HOST:
+        required: true
+      PROD_USER:
+        required: true
+      GHCR_PULL_USER:
+        required: true
+      GHCR_PULL_TOKEN:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+    outputs:
+      version:
+        description: "Tag inmutable de la imagen desplegada (YYYYMMDD-HHMMSS-shortSHA)"
+        value: ${{ jobs.resolve.outputs.version }}
+      image_url:
+        description: "URL completa de la imagen GHCR"
+        value: ${{ jobs.resolve.outputs.image_url }}
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  resolve:
+    name: Resolver ref + tag
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.out.outputs.ref }}
+      sha: ${{ steps.out.outputs.sha }}
+      version: ${{ steps.out.outputs.version }}
+      owner_lc: ${{ steps.out.outputs.owner_lc }}
+      image_url: ${{ steps.out.outputs.image_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+      - id: out
+        run: |
+          REF="${{ github.ref_name }}"
+          SHA="$(git rev-parse --short HEAD)"
+          STAMP="$(date -u +%Y%m%d-%H%M%S)"
+          OWNER_LC="$(echo '${{ env.IMAGE_OWNER }}' | tr '[:upper:]' '[:lower:]')"
+          VERSION="${STAMP}-${SHA}"
+          IMAGE_URL="${{ env.REGISTRY }}/${OWNER_LC}/${{ inputs.image_name }}:${VERSION}"
+          {
+            echo "ref=$REF"
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "owner_lc=$OWNER_LC"
+            echo "image_url=$IMAGE_URL"
+          } >> "$GITHUB_OUTPUT"
+
+  build-image:
+    name: Build & push ${{ inputs.image_name }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:${{ needs.resolve.outputs.version }}
+            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:buildcache,mode=max
+          build-args: |
+            APP_VERSION=${{ needs.resolve.outputs.version }}
+
+  deploy:
+    name: Deploy → VPS (${{ inputs.health_url }})
+    needs: [resolve, build-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes_deploy }}
+    environment:
+      name: ${{ inputs.environment_name }}
+      url: ${{ inputs.health_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Preparar SSH
+        env:
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          HOST: ${{ secrets.PROD_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sincronizar compose.prod.yml al VPS
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          VPS_PATH: ${{ inputs.vps_path }}
+        run: |
+          ssh "$USER@$HOST" "mkdir -p $VPS_PATH"
+          scp compose.prod.yml "$USER@$HOST:$VPS_PATH/compose.prod.yml"
+
+      - name: Backup DB pre-migrate (opcional)
+        if: ${{ inputs.run_migrations && inputs.backup_before_migrate }}
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          VPS_PATH: ${{ inputs.vps_path }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: |
+          ssh "$USER@$HOST" bash -se <<EOF
+          set -euo pipefail
+          BACKUP_DIR="/srv/backups/${IMAGE_NAME}"
+          mkdir -p "\$BACKUP_DIR"
+          STAMP="\$(date -u +%Y%m%d-%H%M%S)"
+          cd "${VPS_PATH}"
+          # Asume que el compose tiene el servicio "db" y que .env tiene POSTGRES_*
+          if docker compose -f compose.prod.yml ps db --format json 2>/dev/null | grep -q '"State":"running"'; then
+            docker compose -f compose.prod.yml exec -T db pg_dumpall -U "\${POSTGRES_USER:-postgres}" \
+              | gzip > "\$BACKUP_DIR/\${STAMP}.sql.gz"
+            echo "Backup en \$BACKUP_DIR/\${STAMP}.sql.gz"
+            # Retención 30 días
+            find "\$BACKUP_DIR" -name "*.sql.gz" -mtime +30 -delete
+          else
+            echo "::notice::Servicio db no está running en este stack, skip backup"
+          fi
+          EOF
+
+      - name: Pull imagen + (migrate) + deploy ${{ inputs.service_name }}
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          VERSION_ENV_VAR: ${{ inputs.version_env_var }}
+          SERVICE: ${{ inputs.service_name }}
+          CONTAINER: ${{ inputs.container_name }}
+          VPS_PATH: ${{ inputs.vps_path }}
+          CHECK_NETWORK: ${{ inputs.check_hubwell_network }}
+          RUN_MIGRATIONS: ${{ inputs.run_migrations }}
+        run: |
+          ssh "$USER@$HOST" bash -se <<EOF
+          set -euo pipefail
+          cd "${VPS_PATH}"
+
+          if [ ! -f .env ]; then
+            echo "::error::Falta ${VPS_PATH}/.env en el VPS (ver .env.prod.example)."
+            exit 1
+          fi
+
+          if [ "${CHECK_NETWORK}" = "true" ]; then
+            if ! docker network inspect hubwell_network >/dev/null 2>&1; then
+              echo "::error::La red 'hubwell_network' no existe en el VPS."
+              exit 1
+            fi
+          fi
+
+          echo "${GHCR_PULL_TOKEN}" | docker login ghcr.io -u "${GHCR_PULL_USER}" --password-stdin
+
+          export ${VERSION_ENV_VAR}="${VERSION}"
+          docker compose -f compose.prod.yml pull "${SERVICE}"
+
+          if [ "${RUN_MIGRATIONS}" = "true" ]; then
+            echo "▶ Ejecutando prisma migrate deploy..."
+            docker compose -f compose.prod.yml run --rm "${SERVICE}" npx prisma migrate deploy || {
+              echo "::error::Migrate falló. NO se subirá la nueva imagen. Revisa backup en /srv/backups/."
+              exit 1
+            }
+          fi
+
+          # --no-deps + --remove-orphans dentro del project: defensa explícita
+          docker compose -f compose.prod.yml up -d --no-deps --remove-orphans "${SERVICE}"
+
+          for i in \$(seq 1 30); do
+            state=\$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo "missing")
+            health=\$(docker inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "no-healthcheck")
+            echo "wait[\$i] state=\$state health=\$health"
+            if [ "\$state" = "running" ] && { [ "\$health" = "healthy" ] || [ "\$health" = "no-healthcheck" ]; }; then
+              break
+            fi
+            if [ "\$i" -eq 30 ]; then
+              echo "::error::Container ${CONTAINER} no llegó a healthy en 90s"
+              docker compose -f compose.prod.yml logs --tail=100 "${SERVICE}"
+              exit 1
+            fi
+            sleep 3
+          done
+
+          docker image prune -f
+          EOF
+
+      - name: Smoke test post-deploy
+        env:
+          HEALTH_URL: ${{ inputs.health_url }}
+        run: |
+          set -e
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -fsS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            if echo "$code" | grep -q "^[23]"; then
+              echo "✅ $HEALTH_URL OK (HTTP $code)"; exit 0
+            fi
+            echo "intento $i: HTTP $code, reintentando..."
+            sleep 10
+          done
+          echo "::error::$HEALTH_URL no responde con 2xx/3xx tras el deploy"
+          exit 1
+
+      - name: Resumen
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          IMAGE: ${{ needs.resolve.outputs.image_url }}
+          HEALTH: ${{ inputs.health_url }}
+        run: |
+          echo "## Deploy summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: $STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`$IMAGE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: $HEALTH" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Notificar Telegram
+    needs: [resolve, deploy]
+    if: always() && (success() || failure())
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram message
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ needs.deploy.result }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          IMAGE: ${{ inputs.image_name }}
+          HEALTH: ${{ inputs.health_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -e
+          if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+            echo "Telegram secrets no configurados, skip notificación."
+            exit 0
+          fi
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="🚀"
+            STATUS_TEXT="✅ success"
+          else
+            EMOJI="🔥"
+            STATUS_TEXT="❌ failed"
+          fi
+          MSG="$EMOJI *Deploy ${IMAGE} → prod*%0A%0A*Version*: \`${VERSION}\`%0A*URL*: ${HEALTH}%0A*Status*: ${STATUS_TEXT}%0A*Por*: @${ACTOR}%0A%0A[Ver run](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+          curl -fsS "https://api.telegram.org/bot${BOT}/sendMessage" \
+            -d "chat_id=${CHAT}" \
+            -d "parse_mode=Markdown" \
+            -d "text=${MSG}" > /dev/null

@@ -1,0 +1,215 @@
+name: ci-node-next (reusable)
+
+# CI base para repos Next.js + TypeScript. Corre en paralelo:
+# - lint (ESLint)
+# - typecheck (tsc --noEmit)
+# - test
+# - audit (npm audit, falla en HIGH+)
+# - build
+#
+# Cada job es opcional vía input. Por defecto, todos corren.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: "Versión de Node a usar"
+        required: false
+        default: "20"
+        type: string
+      package_manager:
+        description: "Gestor de paquetes: npm, pnpm, yarn"
+        required: false
+        default: "npm"
+        type: string
+      working_directory:
+        description: "Directorio de trabajo (para monorepos)"
+        required: false
+        default: "."
+        type: string
+      run_lint:
+        required: false
+        default: true
+        type: boolean
+      run_typecheck:
+        required: false
+        default: true
+        type: boolean
+      run_test:
+        required: false
+        default: true
+        type: boolean
+      run_audit:
+        required: false
+        default: true
+        type: boolean
+      run_build:
+        required: false
+        default: true
+        type: boolean
+      audit_level:
+        description: "Nivel mínimo a fallar en audit (low, moderate, high, critical)"
+        required: false
+        default: "high"
+        type: string
+      lint_command:
+        description: "Comando para lint (override)"
+        required: false
+        default: ""
+        type: string
+      typecheck_command:
+        description: "Comando para typecheck (override)"
+        required: false
+        default: ""
+        type: string
+      test_command:
+        description: "Comando para test (override)"
+        required: false
+        default: ""
+        type: string
+      build_command:
+        description: "Comando para build (override)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    if: ${{ inputs.run_lint }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - name: Install
+        run: |
+          case "${{ inputs.package_manager }}" in
+            npm)   npm ci ;;
+            pnpm)  npm i -g pnpm && pnpm install --frozen-lockfile ;;
+            yarn)  yarn install --frozen-lockfile ;;
+          esac
+      - name: Lint
+        run: |
+          if [ -n "${{ inputs.lint_command }}" ]; then
+            ${{ inputs.lint_command }}
+          else
+            ${{ inputs.package_manager }} run lint
+          fi
+
+  typecheck:
+    name: Typecheck
+    if: ${{ inputs.run_typecheck }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - name: Install
+        run: |
+          case "${{ inputs.package_manager }}" in
+            npm)   npm ci ;;
+            pnpm)  npm i -g pnpm && pnpm install --frozen-lockfile ;;
+            yarn)  yarn install --frozen-lockfile ;;
+          esac
+      - name: Typecheck
+        run: |
+          if [ -n "${{ inputs.typecheck_command }}" ]; then
+            ${{ inputs.typecheck_command }}
+          else
+            ${{ inputs.package_manager }} run typecheck || npx tsc --noEmit
+          fi
+
+  test:
+    name: Test
+    if: ${{ inputs.run_test }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - name: Install
+        run: |
+          case "${{ inputs.package_manager }}" in
+            npm)   npm ci ;;
+            pnpm)  npm i -g pnpm && pnpm install --frozen-lockfile ;;
+            yarn)  yarn install --frozen-lockfile ;;
+          esac
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test_command }}" ]; then
+            ${{ inputs.test_command }}
+          else
+            ${{ inputs.package_manager }} test --if-present
+          fi
+
+  audit:
+    name: Security audit
+    if: ${{ inputs.run_audit }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Audit
+        run: |
+          case "${{ inputs.package_manager }}" in
+            npm)   npm audit --audit-level=${{ inputs.audit_level }} ;;
+            pnpm)  npm i -g pnpm && pnpm audit --audit-level=${{ inputs.audit_level }} ;;
+            yarn)  yarn npm audit --severity=${{ inputs.audit_level }} ;;
+          esac
+
+  build:
+    name: Build
+    if: ${{ inputs.run_build }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - name: Install
+        run: |
+          case "${{ inputs.package_manager }}" in
+            npm)   npm ci ;;
+            pnpm)  npm i -g pnpm && pnpm install --frozen-lockfile ;;
+            yarn)  yarn install --frozen-lockfile ;;
+          esac
+      - name: Build
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            ${{ inputs.package_manager }} run build
+          fi
