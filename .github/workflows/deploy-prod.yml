@@ -281,20 +281,30 @@ jobs:
             exit 1
           fi
 
-          # Extraer keys del example (líneas tipo VAR= o VAR=value, ignorando comentarios)
-          EXAMPLE_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
+          # Extraer keys REQUERIDAS del example (con valor != vacío después del =)
+          # Lógica: VAR=foo → requerida (el example da el valor recomendado)
+          #         VAR=    → opcional (el example dice "define si quieres")
+          REQUIRED_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=.+' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
+          ALL_EXAMPLE_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
           # Extraer keys del .env real (con sudo porque es 600)
           ENV_KEYS=\$(sudo grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_VPS_PATH" | cut -d= -f1 | sort -u)
 
-          # Vars en example pero NO en real → ERROR
-          MISSING=\$(comm -23 <(echo "\$EXAMPLE_KEYS") <(echo "\$ENV_KEYS") || true)
-          if [ -n "\$MISSING" ]; then
-            echo "::error::Vars del $ENV_EXAMPLE que FALTAN en $ENV_VPS_PATH:"
-            echo "\$MISSING" | sed 's/^/  - /'
+          # Vars REQUERIDAS en example pero NO en real → ERROR
+          MISSING_REQUIRED=\$(comm -23 <(echo "\$REQUIRED_KEYS") <(echo "\$ENV_KEYS") || true)
+          if [ -n "\$MISSING_REQUIRED" ]; then
+            echo "::error::Vars REQUERIDAS del $ENV_EXAMPLE que FALTAN en $ENV_VPS_PATH:"
+            echo "\$MISSING_REQUIRED" | sed 's/^/  - /'
             echo "::error::Añade los valores reales en $ENV_VPS_PATH del VPS antes de re-deployar."
             echo "::error::Deploy abortado SIN tocar el container previo (zero downtime en error)."
             rm -f /tmp/_env_validation_example
             exit 1
+          fi
+
+          # Vars OPCIONALES (con = vacío en example) que faltan → solo notice
+          MISSING_OPTIONAL=\$(comm -23 <(echo "\$ALL_EXAMPLE_KEYS") <(echo "\$ENV_KEYS") | comm -23 - <(echo "\$REQUIRED_KEYS") || true)
+          if [ -n "\$MISSING_OPTIONAL" ]; then
+            echo "::notice::Vars opcionales del $ENV_EXAMPLE no definidas en $ENV_VPS_PATH (skip):"
+            echo "\$MISSING_OPTIONAL" | sed 's/^/  - /'
           fi
 
           # Vars con placeholders comunes → WARNING (no aborta)
