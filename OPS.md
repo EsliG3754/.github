@@ -128,56 +128,154 @@ npx prisma migrate reset
 
 ## 4. Secrets y rotación
 
-### 4.1 Inventario de secrets
+### 4.1 Inventario consolidado
 
-| Secret | Dónde | Rotación | Última |
+**GitHub Secrets** (a nivel repo, replicados en los 4):
+
+| Secret | Propósito | Cadencia | Próxima rotación |
 |---|---|---|---|
-| `PROD_SSH_KEY` | GitHub Secrets (org) | 90 días | TBD |
-| `PROD_HOST` | GitHub Secrets | inmutable | — |
-| `PROD_USER` | GitHub Secrets | inmutable | — |
-| `GHCR_PULL_USER` | GitHub Secrets | 90 días | TBD |
-| `GHCR_PULL_TOKEN` | GitHub Secrets | 90 días | TBD |
-| `NEXTAUTH_SECRET` | VPS .env por servicio | 180 días | TBD |
-| `KARIO_KEY_*` | VPS .env (kario emite, otros consumen) | 180 días | TBD |
-| `RESEND_API_KEY` | VPS .env | 365 días | TBD |
-| `TURNSTILE_SECRET_KEY` | VPS .env | 365 días | TBD |
-| `BANXICO_TOKEN` | VPS .env | 365 días | TBD |
+| `PROD_SSH_KEY` | Clave SSH para deploy al VPS | **90 días** | _ver Issues "ops: rotación de secrets"_ |
+| `PROD_HOST` | IP/hostname del VPS | inmutable | — |
+| `PROD_USER` | Usuario SSH para deploy | inmutable | — |
+| `GHCR_PULL_USER` | Usuario para `docker login ghcr.io` | inmutable | — |
+| `GHCR_PULL_TOKEN` | PAT con `read:packages` para pull | **90 días** | _ver Issues_ |
+| `TELEGRAM_BOT_TOKEN` | Bot @logwell_ops_bot | **365 días** | _ver Issues_ |
+| `TELEGRAM_CHAT_ID` | Canal "Logwell Deploys" | inmutable | — |
 
-### 4.2 Procedimiento de rotación de `PROD_SSH_KEY`
+**VPS `/srv/<servicio>/.env`** (no en GitHub):
+
+| Secret | Servicio | Cadencia | Notas |
+|---|---|---|---|
+| `NEXTAUTH_SECRET` | hubwell_portal, hubwell_react | **180 días** | rotación rota sesiones; coordinar |
+| `KARIO_HANDOFF_SECRET` | hubwell_portal + kario (compartido) | **180 días** | DEBE ser el mismo valor en ambos |
+| `KAIRO_KEY_WEB`, `_CLIENTS`, `_HUBWELL` | kario emite, callers consumen | **180 días** | rotar ALL al mismo tiempo |
+| `KAIRO_ADMIN_KEY` | kario | 180 días | opcional, solo endpoints admin |
+| `ANTHROPIC_API_KEY` | kario | **on-incident** | rotar inmediatamente si leak |
+| `JWT_SECRET`, `JWT_CLIENT_SECRET` | hubwell_react/api | **180 días** | rotación rota sesiones |
+| `RESEND_API_KEY` | hubwell_portal, logwellv2 | **365 días** | desde dashboard Resend |
+| `TURNSTILE_SECRET_KEY` | logwellv2, portal | 365 días | Cloudflare Turnstile |
+| `BANXICO_TOKEN` | logwellv2 | 365 días | bajo demanda, no leak crítico |
+
+### 4.2 Procedimiento por tipo de secret
+
+#### A. `PROD_SSH_KEY` (zero-downtime)
 
 ```bash
-# 1. Generar nueva clave
-ssh-keygen -t ed25519 -f ~/.ssh/logwell_deploy_new -C "logwell-deploy-$(date +%Y%m%d)"
+# 1. Generar nueva clave (ed25519, recomendado)
+ssh-keygen -t ed25519 -f ~/.ssh/logwell_deploy_$(date +%Y%m) -C "logwell-deploy-$(date +%Y%m)" -N ""
 
-# 2. Añadir al VPS (mantener la vieja activa todavía)
-ssh-copy-id -i ~/.ssh/logwell_deploy_new.pub user@vps
+# 2. Añadir la NUEVA al VPS (manteniendo la vieja activa)
+cat ~/.ssh/logwell_deploy_$(date +%Y%m).pub | ssh user@vps "cat >> ~/.ssh/authorized_keys"
 
-# 3. Actualizar GitHub Secret en cada repo
-for repo in logwellv2 hubwell_portal hubwell_react kario; do
-  gh secret set PROD_SSH_KEY --repo ESLIMX/$repo < ~/.ssh/logwell_deploy_new
+# 3. Actualizar GitHub Secret en los 4 repos
+for repo in logwellv2 hubwell_portal hubwell_react Kairo; do
+  gh secret set PROD_SSH_KEY --repo ESLIMX/$repo < ~/.ssh/logwell_deploy_$(date +%Y%m)
 done
 
-# 4. Disparar un deploy de prueba en cada repo. Si pasa → eliminar la vieja.
+# 4. Disparar workflow_dispatch de deploy en cada repo y verificar success
+for repo in logwellv2 hubwell_portal hubwell_react Kairo; do
+  gh workflow run deploy-prod.yml --repo ESLIMX/$repo --ref main
+done
+# Esperar ~5 min y verificar todos verdes en GitHub Actions
+
+# 5. Si los 4 deploys pasaron, eliminar la vieja del VPS
 ssh user@vps "sed -i '/<huella-vieja>/d' ~/.ssh/authorized_keys"
+ssh user@vps "grep -c '' ~/.ssh/authorized_keys"  # debe coincidir con num claves esperadas
 ```
 
-### 4.3 Rotación de `GHCR_PULL_TOKEN`
+#### B. `GHCR_PULL_TOKEN` (zero-downtime)
 
 ```bash
-# 1. Crear nuevo PAT con scope read:packages, expiración 90 días
-gh auth refresh -s read:packages
+# 1. En GitHub web: Settings → Developer settings → Personal access tokens (classic)
+#    → Generate new token con scope `read:packages`, expiración 90 días.
+#    Nombre: "logwell-ghcr-pull-YYYYMM"
+#    Copiar el token (solo se muestra una vez).
 
-# 2. Generar token con gh + actualizar en los 4 repos (en paralelo)
-NEW_TOKEN=$(gh api user/packages-token ...)  # TBD comando exacto
-for repo in logwellv2 hubwell_portal hubwell_react kario; do
+NEW_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 2. Verificar que funciona contra GHCR
+echo "$NEW_TOKEN" | docker login ghcr.io -u <user> --password-stdin
+
+# 3. Actualizar en los 4 repos
+for repo in logwellv2 hubwell_portal hubwell_react Kairo; do
   gh secret set GHCR_PULL_TOKEN --repo ESLIMX/$repo --body "$NEW_TOKEN"
 done
 
-# 3. Validar pulleando manualmente en el VPS
-ssh user@vps "echo $NEW_TOKEN | docker login ghcr.io -u <user> --password-stdin"
+# 4. Disparar workflow_dispatch en cada repo. Si pasan → revocar el token viejo
+#    desde Settings → Developer settings → Personal access tokens → Delete
 ```
 
-Ver §10 para automatización con `/schedule`.
+#### C. `KARIO_HANDOFF_SECRET` (afecta handoffs activos)
+
+⚠️ Coordinar con el equipo: rotar este secret invalida prefills firmados existentes (sesiones de chat con quote handoff a la mitad fallarán al completar).
+
+```bash
+# 1. Generar nuevo secret (>= 32 chars)
+NEW_SECRET=$(openssl rand -base64 48 | tr '/+' '_-' | tr -d '\n=')
+
+# 2. SSH al VPS y actualizar EN AMBOS .env (atómico)
+ssh user@vps "
+sudo sed -i 's|^KARIO_HANDOFF_SECRET=.*|KARIO_HANDOFF_SECRET=$NEW_SECRET|' /srv/kario/.env /srv/hubwell-portal/.env
+sudo grep '^KARIO_HANDOFF_SECRET=' /srv/kario/.env /srv/hubwell-portal/.env
+"
+
+# 3. Reiniciar AMBOS containers con rollback (sin rebuild)
+gh workflow run rollback.yml --repo ESLIMX/Kairo -f version=latest
+gh workflow run rollback.yml --repo ESLIMX/hubwell_portal -f version=latest
+```
+
+#### D. `KAIRO_KEY_*` (3 keys, rotar ALL al mismo tiempo)
+
+```bash
+# 1. Generar las 3 nuevas
+KEY_WEB=$(openssl rand -base64 48 | tr '/+' '_-' | tr -d '\n=')
+KEY_CLIENTS=$(openssl rand -base64 48 | tr '/+' '_-' | tr -d '\n=')
+KEY_HUBWELL=$(openssl rand -base64 48 | tr '/+' '_-' | tr -d '\n=')
+
+# 2. Actualizar en kario (emite) Y en cada caller (consume)
+ssh user@vps "
+# kario tiene las 3
+sudo sed -i 's|^KAIRO_KEY_WEB=.*|KAIRO_KEY_WEB=$KEY_WEB|' /srv/kario/.env
+sudo sed -i 's|^KAIRO_KEY_CLIENTS=.*|KAIRO_KEY_CLIENTS=$KEY_CLIENTS|' /srv/kario/.env
+sudo sed -i 's|^KAIRO_KEY_HUBWELL=.*|KAIRO_KEY_HUBWELL=$KEY_HUBWELL|' /srv/kario/.env
+
+# logwellv2 usa KAIRO_KEY_WEB (con nombre KARIO_KEY)
+sudo sed -i 's|^KARIO_KEY=.*|KARIO_KEY=$KEY_WEB|' /srv/logwellv2/.env
+
+# portal usa KAIRO_KEY_CLIENTS (con nombre KARIO_KEY)
+sudo sed -i 's|^KARIO_KEY=.*|KARIO_KEY=$KEY_CLIENTS|' /srv/hubwell-portal/.env
+
+# hubwell_react usa KAIRO_KEY_HUBWELL — buscar en su .env el nombre exacto
+"
+
+# 3. Rollback (reinicio) de los 4 containers para tomar nuevas keys
+for repo in Kairo logwellv2 hubwell_portal hubwell_react; do
+  gh workflow run rollback.yml --repo ESLIMX/$repo -f version=latest
+done
+```
+
+#### E. `ANTHROPIC_API_KEY` (incident-driven)
+
+```bash
+# Solo en respuesta a un incidente o sospecha de leak.
+# 1. Console Anthropic → API Keys → Generate new (revocar la vieja primero si es seguro)
+# 2. SSH:
+ssh user@vps "sudo sed -i 's|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=<nueva>|' /srv/kario/.env"
+# 3. Rollback kario para tomar la nueva
+gh workflow run rollback.yml --repo ESLIMX/Kairo -f version=latest
+# 4. Revocar la vieja en console Anthropic
+```
+
+### 4.3 Recordatorio automático
+
+Workflow [`rotation-reminder.yml`](.github/workflows/rotation-reminder.yml) corre cron `0 9 1 */3 *` (1 enero/abril/julio/octubre 9am UTC) y abre un **Issue** en `ESLIMX/.github` con checklist de rotación trimestral. Las rotaciones se consideran completas al cerrar el issue.
+
+### 4.4 Reglas de oro
+
+1. Rotar UN secret a la vez (no cambiar 3 simultáneamente fuera de KAIRO_KEY_*).
+2. Validar con un deploy de prueba ANTES de revocar el viejo.
+3. Documentar la rotación en el issue (fecha, quién, breve resumen).
+4. Si rotaste por incidente, hacer post-mortem en 48 horas.
 
 ---
 
