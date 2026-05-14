@@ -53,6 +53,21 @@ on:
         required: false
         default: true
         type: boolean
+      validate_env:
+        description: "Validar .env del VPS contra .env.prod.example antes del up. Si falta una var, abortar deploy SIN tirar container previo."
+        required: false
+        default: true
+        type: boolean
+      env_example_path:
+        description: "Path al .env example en el repo (default .env.prod.example)"
+        required: false
+        default: ".env.prod.example"
+        type: string
+      env_vps_path:
+        description: "Path al .env real en el VPS (default <vps_path>/.env)"
+        required: false
+        default: ""
+        type: string
       kill_host_ports:
         description: "Antes del up, matar cualquier container que ocupe estos host:port (coma-separado, ej '127.0.0.1:3004,0.0.0.0:8080'). Útil cuando un deploy previo dejó fantasmas con nombre distinto al esperado."
         required: false
@@ -232,6 +247,73 @@ jobs:
           REMOTE_DIR="$VPS_PATH/$(dirname "$COMPOSE_FILE")"
           ssh "$USER@$HOST" "mkdir -p '$REMOTE_DIR'"
           scp "$COMPOSE_FILE" "$USER@$HOST:$VPS_PATH/$COMPOSE_FILE"
+
+      - name: Validar .env del VPS contra .env.prod.example
+        if: ${{ inputs.validate_env }}
+        env:
+          HOST: ${{ secrets.PROD_HOST }}
+          USER: ${{ secrets.PROD_USER }}
+          VPS_PATH: ${{ inputs.vps_path }}
+          ENV_EXAMPLE: ${{ inputs.env_example_path }}
+          ENV_VPS_OVERRIDE: ${{ inputs.env_vps_path }}
+        run: |
+          if [ ! -f "$ENV_EXAMPLE" ]; then
+            echo "::warning::No existe $ENV_EXAMPLE en el repo, skip validación del .env"
+            exit 0
+          fi
+
+          # Determinar path real del .env en el VPS
+          if [ -n "$ENV_VPS_OVERRIDE" ]; then
+            ENV_VPS_PATH="$ENV_VPS_OVERRIDE"
+          else
+            ENV_VPS_PATH="$VPS_PATH/.env"
+          fi
+
+          # Subir el example a /tmp del VPS para validar
+          scp "$ENV_EXAMPLE" "$USER@$HOST:/tmp/_env_validation_example"
+
+          ssh "$USER@$HOST" bash -se <<EOF
+          set -euo pipefail
+
+          if [ ! -f "$ENV_VPS_PATH" ]; then
+            echo "::error::No existe $ENV_VPS_PATH en el VPS"
+            rm -f /tmp/_env_validation_example
+            exit 1
+          fi
+
+          # Extraer keys del example (líneas tipo VAR= o VAR=value, ignorando comentarios)
+          EXAMPLE_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
+          # Extraer keys del .env real (con sudo porque es 600)
+          ENV_KEYS=\$(sudo grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_VPS_PATH" | cut -d= -f1 | sort -u)
+
+          # Vars en example pero NO en real → ERROR
+          MISSING=\$(comm -23 <(echo "\$EXAMPLE_KEYS") <(echo "\$ENV_KEYS") || true)
+          if [ -n "\$MISSING" ]; then
+            echo "::error::Vars del $ENV_EXAMPLE que FALTAN en $ENV_VPS_PATH:"
+            echo "\$MISSING" | sed 's/^/  - /'
+            echo "::error::Añade los valores reales en $ENV_VPS_PATH del VPS antes de re-deployar."
+            echo "::error::Deploy abortado SIN tocar el container previo (zero downtime en error)."
+            rm -f /tmp/_env_validation_example
+            exit 1
+          fi
+
+          # Vars con placeholders comunes → WARNING (no aborta)
+          PLACEHOLDERS=\$(sudo grep -EH '^[A-Z_][A-Z0-9_]*=(change-me|changeme|xxx|XXX|TODO|todo|placeholder|PLACEHOLDER|<.*>|""|'\'\'')$' "$ENV_VPS_PATH" || true)
+          if [ -n "\$PLACEHOLDERS" ]; then
+            echo "::warning::Vars con valor placeholder en $ENV_VPS_PATH (cambiar en producción):"
+            echo "\$PLACEHOLDERS" | sed 's/^/  /'
+          fi
+
+          # Vars en real pero no en example → solo informativo
+          EXTRA=\$(comm -13 <(echo "\$EXAMPLE_KEYS") <(echo "\$ENV_KEYS") || true)
+          if [ -n "\$EXTRA" ]; then
+            echo "::notice::Vars en $ENV_VPS_PATH no documentadas en $ENV_EXAMPLE (legacy o overrides locales):"
+            echo "\$EXTRA" | sed 's/^/  - /'
+          fi
+
+          echo "✅ Validación .env OK — todas las vars requeridas presentes"
+          rm -f /tmp/_env_validation_example
+          EOF
 
       - name: Backup DB pre-migrate (opcional)
         if: ${{ inputs.run_migrations && inputs.backup_before_migrate }}
