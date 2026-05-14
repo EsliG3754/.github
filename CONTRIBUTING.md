@@ -10,7 +10,7 @@ Lee primero:
 ## Setup local
 
 ```bash
-git clone git@github.com:EsliG3754/<repo>.git
+git clone git@github.com:ESLIMX/<repo>.git
 cd <repo>
 nvm use         # respeta .nvmrc del repo
 npm install     # o pnpm install si el repo lo usa

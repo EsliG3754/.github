@@ -19,7 +19,7 @@ Todos comparten la red docker `hubwell_network` (external) en el VPS principal. 
 
 1. Mergear PR a `main` (squash, vía GitHub UI).
 2. El workflow `deploy-prod.yml` se dispara automáticamente.
-3. Build de imagen → push a `ghcr.io/EsliG3754/<servicio>:<tag>`.
+3. Build de imagen → push a `ghcr.io/ESLIMX/<servicio>:<tag>`.
 4. SSH al VPS → `docker compose pull && up -d`.
 5. Healthcheck. Si falla → el contenedor previo sigue corriendo (rolling).
 6. Notificación a Telegram/Slack con resultado.
@@ -29,7 +29,7 @@ Todos comparten la red docker `hubwell_network` (external) en el VPS principal. 
 ### 1.2 Deploy manual (forzar redeploy sin cambios)
 
 ```bash
-gh workflow run deploy-prod.yml --repo EsliG3754/<repo> -f ref=main
+gh workflow run deploy-prod.yml --repo ESLIMX/<repo> -f ref=main
 ```
 
 ### 1.3 ¿Qué se preserva entre deploys?
@@ -53,7 +53,7 @@ gh workflow run deploy-prod.yml --repo EsliG3754/<repo> -f ref=main
 Si el deploy actual rompe producción:
 
 ```bash
-gh workflow run rollback.yml --repo EsliG3754/<repo> -f version=<tag-previo>
+gh workflow run rollback.yml --repo ESLIMX/<repo> -f version=<tag-previo>
 ```
 
 `<tag-previo>` se obtiene del listado de imágenes en GHCR:
@@ -154,7 +154,7 @@ ssh-copy-id -i ~/.ssh/logwell_deploy_new.pub user@vps
 
 # 3. Actualizar GitHub Secret en cada repo
 for repo in logwellv2 hubwell_portal hubwell_react kario; do
-  gh secret set PROD_SSH_KEY --repo EsliG3754/$repo < ~/.ssh/logwell_deploy_new
+  gh secret set PROD_SSH_KEY --repo ESLIMX/$repo < ~/.ssh/logwell_deploy_new
 done
 
 # 4. Disparar un deploy de prueba en cada repo. Si pasa → eliminar la vieja.
@@ -170,7 +170,7 @@ gh auth refresh -s read:packages
 # 2. Generar token con gh + actualizar en los 4 repos (en paralelo)
 NEW_TOKEN=$(gh api user/packages-token ...)  # TBD comando exacto
 for repo in logwellv2 hubwell_portal hubwell_react kario; do
-  gh secret set GHCR_PULL_TOKEN --repo EsliG3754/$repo --body "$NEW_TOKEN"
+  gh secret set GHCR_PULL_TOKEN --repo ESLIMX/$repo --body "$NEW_TOKEN"
 done
 
 # 3. Validar pulleando manualmente en el VPS
@@ -261,7 +261,7 @@ Cuando los pipelines lleven 2-4 semanas estables:
 ### 7.3 Deploy en loop o atascado
 
 1. Concurrency group debe prevenir duplicados (ver `concurrency:` en workflow).
-2. Cancel manual: `gh run cancel <run-id> --repo EsliG3754/<repo>`.
+2. Cancel manual: `gh run cancel <run-id> --repo ESLIMX/<repo>`.
 3. Si el contenedor nuevo no arranca → docker compose up -d con imagen previa.
 
 ---
@@ -282,9 +282,9 @@ Refresh automático cada 30 segundos. Implementación: página estática consumi
 
 ### 8.2 Vistas nativas de GitHub
 
-- **Environments**: https://github.com/EsliG3754/<repo>/deployments
-- **Actions**: https://github.com/EsliG3754/<repo>/actions
-- **Releases**: https://github.com/EsliG3754/<repo>/releases
+- **Environments**: https://github.com/ESLIMX/<repo>/deployments
+- **Actions**: https://github.com/ESLIMX/<repo>/actions
+- **Releases**: https://github.com/ESLIMX/<repo>/releases
 
 ---
 
@@ -296,9 +296,9 @@ Cada deploy postea a Telegram bot `@logwell_ops_bot` (canal privado):
 🚀 Deploy <servicio> → prod
 Versión: 20260513-184500-abc1234
 Commit: feat(scope): mensaje
-Autor: @EsliG3754
+Autor: @ESLIMX
 Estado: ✅ success (2m 14s)
-Run: https://github.com/EsliG3754/<repo>/actions/runs/<id>
+Run: https://github.com/ESLIMX/<repo>/actions/runs/<id>
 ```
 
 Si falla → `❌ failed` + link al run + mention.
@@ -333,8 +333,8 @@ Configuradas con `/schedule`:
 | Rol | Persona | Contacto |
 |---|---|---|
 | Owner / DevOps | Eslí (Bryan) | bryan.epg3754@gmail.com |
-| GitHub org | EsliG3754 | https://github.com/EsliG3754 |
+| GitHub org | ESLIMX | https://github.com/ESLIMX |
 
 ---
 
-**Última actualización**: 2026-05-13. Este documento vive en `EsliG3754/.github/OPS.md`. PRs para mantenerlo al día son bienvenidos.
+**Última actualización**: 2026-05-13. Este documento vive en `ESLIMX/.github/OPS.md`. PRs para mantenerlo al día son bienvenidos.

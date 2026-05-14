@@ -4,10 +4,10 @@ Plataforma de servicios profesionales operada por Logwell. 4 productos, una sola
 
 | Servicio | Dominio | Repo |
 |---|---|---|
-| Sitio público | [logwell.mx](https://logwell.mx) | [logwellv2](https://github.com/EsliG3754/logwellv2) |
-| Portal de clientes | [clientes.logwell.mx](https://clientes.logwell.mx) | [hubwell_portal](https://github.com/EsliG3754/hubwell_portal) |
-| Plataforma interna | [hub.logwell.mx](https://hub.logwell.mx) | [hubwell_react](https://github.com/EsliG3754/hubwell_react) |
-| IA orquestadora | kairo.logwell.mx | [kario](https://github.com/EsliG3754/kario) |
+| Sitio público | [logwell.mx](https://logwell.mx) | [logwellv2](https://github.com/ESLIMX/logwellv2) |
+| Portal de clientes | [clientes.logwell.mx](https://clientes.logwell.mx) | [hubwell_portal](https://github.com/ESLIMX/hubwell_portal) |
+| Plataforma interna | [hub.logwell.mx](https://hub.logwell.mx) | [hubwell_react](https://github.com/ESLIMX/hubwell_react) |
+| IA orquestadora | kairo.logwell.mx | [kario](https://github.com/ESLIMX/kario) |
 
 ## Documentación
 
