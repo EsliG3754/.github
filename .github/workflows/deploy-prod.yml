@@ -53,6 +53,11 @@ on:
         required: false
         default: true
         type: boolean
+      kill_host_ports:
+        description: "Antes del up, matar cualquier container que ocupe estos host:port (coma-separado, ej '127.0.0.1:3004,0.0.0.0:8080'). Útil cuando un deploy previo dejó fantasmas con nombre distinto al esperado."
+        required: false
+        default: ""
+        type: string
       smoke_test_mode:
         description: "Modo de smoke test post-deploy: 'public' (curl al health_url), 'internal' (docker run en network interna), 'none'"
         required: false
@@ -267,6 +272,7 @@ jobs:
           VPS_PATH: ${{ inputs.vps_path }}
           COMPOSE_FILE: ${{ inputs.compose_file }}
           CHECK_NETWORK: ${{ inputs.check_hubwell_network }}
+          KILL_HOST_PORTS: ${{ inputs.kill_host_ports }}
           RUN_MIGRATIONS: ${{ inputs.run_migrations }}
           WAIT_MAX_SECONDS: ${{ inputs.wait_max_seconds }}
           WAIT_GRACE_PERIOD: ${{ inputs.wait_grace_period_seconds }}
@@ -288,6 +294,21 @@ jobs:
           fi
 
           echo "${GHCR_PULL_TOKEN}" | docker login ghcr.io -u "${GHCR_PULL_USER}" --password-stdin
+
+          # Pre-up: matar containers fantasma que ocupen los host ports declarados.
+          # Necesario cuando un deploy previo dejó un container en restart loop con
+          # nombre distinto al actual (ej kario tras un crash + restart de docker).
+          if [ -n "${KILL_HOST_PORTS}" ]; then
+            IFS=',' read -ra PORTS <<< "${KILL_HOST_PORTS}"
+            for port in "\${PORTS[@]}"; do
+              port=\$(echo "\$port" | xargs)  # trim whitespace
+              COLLIDING=\$(docker ps -aq --filter "publish=\$port" 2>/dev/null || true)
+              if [ -n "\$COLLIDING" ]; then
+                echo "::warning::Containers ocupando \$port: \$COLLIDING — limpiando"
+                docker rm -f \$COLLIDING 2>&1 | sed 's/^/  /' || true
+              fi
+            done
+          fi
 
           export ${VERSION_ENV_VAR}="${VERSION}"
           docker compose -f "${COMPOSE_FILE}" pull "${SERVICE}"
