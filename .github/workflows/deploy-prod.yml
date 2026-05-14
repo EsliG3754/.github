@@ -298,14 +298,32 @@ jobs:
           # Pre-up: matar containers fantasma que ocupen los host ports declarados.
           # Necesario cuando un deploy previo dejó un container en restart loop con
           # nombre distinto al actual (ej kario tras un crash + restart de docker).
+          # Acepta formatos "127.0.0.1:3004" o "3004" — extrae solo el puerto para el filter.
           if [ -n "${KILL_HOST_PORTS}" ]; then
             IFS=',' read -ra PORTS <<< "${KILL_HOST_PORTS}"
-            for port in "\${PORTS[@]}"; do
-              port=\$(echo "\$port" | xargs)  # trim whitespace
-              COLLIDING=\$(docker ps -aq --filter "publish=\$port" 2>/dev/null || true)
+            for port_spec in "\${PORTS[@]}"; do
+              port_spec=\$(echo "\$port_spec" | xargs)
+              # Extraer puerto numérico (después del último ":" o el spec entero)
+              port_num=\$(echo "\$port_spec" | rev | cut -d: -f1 | rev)
+              echo "▶ Verificando puerto \$port_num (spec: \$port_spec)..."
+
+              echo "  docker ps -a --filter publish=\$port_num:"
+              docker ps -a --filter "publish=\$port_num" --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}' || true
+
+              COLLIDING=\$(docker ps -aq --filter "publish=\$port_num" 2>/dev/null || true)
               if [ -n "\$COLLIDING" ]; then
-                echo "::warning::Containers ocupando \$port: \$COLLIDING — limpiando"
+                echo "::warning::Containers ocupando puerto \$port_num: \$COLLIDING — limpiando"
                 docker rm -f \$COLLIDING 2>&1 | sed 's/^/  /' || true
+              fi
+
+              # Si tras limpiar containers el puerto sigue ocupado, mostrar qué proceso lo tiene.
+              # No matamos procesos del host automáticamente (peligroso); solo informamos.
+              if command -v ss >/dev/null 2>&1; then
+                LISTENERS=\$(ss -tlnp 2>/dev/null | grep ":\$port_num " || true)
+                if [ -n "\$LISTENERS" ]; then
+                  echo "::warning::Puerto \$port_num sigue con listeners (no-docker?):"
+                  echo "\$LISTENERS" | sed 's/^/  /'
+                fi
               fi
             done
           fi
