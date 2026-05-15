@@ -1,47 +1,70 @@
 name: deploy-prod (reusable)
 
+# Workflow reutilizable para deploy a producción.
+#
+# Soporta dos modos:
+#   - Single-image (compat con portal/v2/kario): usa `image_name` + `service_name` + `container_name` directos.
+#   - Multi-image (hub): usa `images_json` con un array de imágenes que se buildean en matrix y se despliegan juntas.
+#
+# Versionado:
+#   - Push a un tag git (ref_type=tag): VERSION = nombre del tag (ej. v1.45.0).
+#   - Push a una rama: VERSION = YYYYMMDD-HHMMSS-shortSHA.
+#   - workflow_dispatch con input `version_override`: override explícito.
+#
+# `:latest` se mueve en cada deploy. El TAG inmutable es el identificador estable.
+
 on:
   workflow_call:
     inputs:
+      # ── Single-image inputs (modo compat) ──
       image_name:
-        description: "Nombre de la imagen GHCR (ej: logwellv2, hubwell-portal, hubwell-api, kario)"
-        required: true
-        type: string
-      vps_path:
-        description: "Ruta absoluta del stack en el VPS (ej: /srv/logwellv2)"
-        required: true
+        description: "Nombre de la imagen GHCR para single-image (ej: logwellv2, hubwell-portal). Ignorado si images_json está definido."
+        required: false
+        default: ""
         type: string
       service_name:
-        description: "Nombre del servicio en compose.prod.yml (ej: web, portal, api)"
+        description: "Nombre del servicio en compose (single-image). Default: web."
         required: false
         default: "web"
         type: string
       container_name:
-        description: "container_name del servicio (ej: logwellv2_prod)"
-        required: true
-        type: string
-      version_env_var:
-        description: "Nombre de la env var que compose espera (ej: WEB_VERSION, PORTAL_VERSION)"
-        required: true
-        type: string
-      health_url:
-        description: "URL pública para smoke test (ej: https://logwell.mx)"
-        required: true
-        type: string
-      environment_name:
-        description: "Nombre del environment en GitHub (default: production)"
+        description: "container_name (single-image). Required si images_json no está definido."
         required: false
-        default: "production"
+        default: ""
         type: string
       dockerfile:
-        description: "Path al Dockerfile (default: Dockerfile)"
+        description: "Path al Dockerfile (single-image). Default: Dockerfile."
         required: false
         default: "Dockerfile"
         type: string
       docker_context:
-        description: "Build context (default: .)"
+        description: "Build context (single-image). Default: ."
         required: false
         default: "."
+        type: string
+
+      # ── Multi-image input (modo monorepo) ──
+      images_json:
+        description: |
+          JSON array para multi-image. Si está vacío, se usa el modo single-image desde los inputs de arriba.
+          Esquema por item: {image_name, dockerfile, docker_context, service_name, container_name}.
+          Ejemplo:
+            [
+              {"image_name":"hubwell-api","dockerfile":"apps/api/Dockerfile","docker_context":"apps/api","service_name":"api","container_name":"hubwell_api_prod"},
+              {"image_name":"hubwell-web","dockerfile":"apps/web/Dockerfile","docker_context":"apps/web","service_name":"web","container_name":"hubwell_web_prod"}
+            ]
+        required: false
+        default: ""
+        type: string
+
+      # ── Stack / VPS ──
+      vps_path:
+        description: "Ruta absoluta del stack en el VPS (ej: /srv/logwellv2)"
+        required: true
+        type: string
+      version_env_var:
+        description: "Nombre de la env var que compose espera (ej: WEB_VERSION, PORTAL_VERSION, HUBWELL_VERSION)"
+        required: true
         type: string
       compose_file:
         description: "Path al compose file (relativo al repo y al vps_path). Default: compose.prod.yml"
@@ -53,6 +76,20 @@ on:
         required: false
         default: true
         type: boolean
+
+      # ── Versionado ──
+      version_override:
+        description: "Override explícito de la versión (ej. desde workflow_dispatch input). Si vacío, se autocalcula."
+        required: false
+        default: ""
+        type: string
+
+      # ── Environment / .env validation ──
+      environment_name:
+        description: "Nombre del environment en GitHub (default: production)"
+        required: false
+        default: "production"
+        type: string
       validate_env:
         description: "Validar .env del VPS contra .env.prod.example antes del up. Si falta una var, abortar deploy SIN tirar container previo."
         required: false
@@ -68,38 +105,37 @@ on:
         required: false
         default: ""
         type: string
-      kill_host_ports:
-        description: "Antes del up, matar cualquier container que ocupe estos host:port (coma-separado, ej '127.0.0.1:3004,0.0.0.0:8080'). Útil cuando un deploy previo dejó fantasmas con nombre distinto al esperado."
-        required: false
-        default: ""
-        type: string
-      smoke_test_mode:
-        description: "Modo de smoke test post-deploy: 'public' (curl al health_url), 'internal' (docker run en network interna), 'none'"
-        required: false
-        default: "public"
-        type: string
-      smoke_internal_url:
-        description: "Cuando smoke_test_mode=internal, URL HTTP a probar desde la red docker (ej http://kario:3004/health)"
-        required: false
-        default: ""
-        type: string
-      smoke_internal_network:
-        description: "Nombre de red docker para smoke interno"
-        required: false
-        default: "hubwell_network"
-        type: string
+
+      # ── Migrations ──
       run_migrations:
-        description: "Ejecutar prisma migrate deploy antes del up"
+        description: "Ejecutar migrations antes del up del resto de servicios."
         required: false
         default: false
         type: boolean
+      migrate_service:
+        description: "Service que corre las migrations. Default = service_name (single-image) o primer service de images_json (multi)."
+        required: false
+        default: ""
+        type: string
+      migrate_command:
+        description: "Comando para correr migrations (ej. 'npx prisma migrate deploy', 'pnpm exec prisma migrate deploy')"
+        required: false
+        default: "npx prisma migrate deploy"
+        type: string
       backup_before_migrate:
         description: "Hacer pg_dump antes de migrate (requiere run_migrations=true)"
         required: false
         default: true
         type: boolean
+
+      # ── Operacional ──
+      kill_host_ports:
+        description: "Antes del up, matar containers que ocupen estos host:port (coma-separado). Útil para limpiar fantasmas."
+        required: false
+        default: ""
+        type: string
       wait_max_seconds:
-        description: "Tiempo máximo a esperar a que el container llegue a healthy (segundos)"
+        description: "Tiempo máximo a esperar a que todos los containers lleguen a healthy (segundos)"
         required: false
         default: 90
         type: number
@@ -118,6 +154,32 @@ on:
         required: false
         default: 15
         type: number
+
+      # ── Smoke tests ──
+      health_url:
+        description: "URL pública principal para smoke test (ej: https://logwell.mx). También se publica como environment URL."
+        required: true
+        type: string
+      smoke_urls:
+        description: "URLs adicionales para smoke (coma-separadas). Cada una debe responder 2xx/3xx. Si vacío, solo se prueba health_url."
+        required: false
+        default: ""
+        type: string
+      smoke_test_mode:
+        description: "'public' (curl al health_url + smoke_urls), 'internal' (docker run en network), 'none'"
+        required: false
+        default: "public"
+        type: string
+      smoke_internal_url:
+        description: "Cuando smoke_test_mode=internal, URL HTTP a probar desde la red docker"
+        required: false
+        default: ""
+        type: string
+      smoke_internal_network:
+        description: "Nombre de red docker para smoke interno"
+        required: false
+        default: "hubwell_network"
+        type: string
     secrets:
       PROD_SSH_KEY:
         required: true
@@ -125,21 +187,17 @@ on:
         required: true
       PROD_USER:
         required: true
-      GHCR_PULL_USER:
-        required: true
-      GHCR_PULL_TOKEN:
-        required: true
       TELEGRAM_BOT_TOKEN:
         required: false
       TELEGRAM_CHAT_ID:
         required: false
     outputs:
       version:
-        description: "Tag inmutable de la imagen desplegada (YYYYMMDD-HHMMSS-shortSHA)"
+        description: "Tag inmutable de la imagen desplegada"
         value: ${{ jobs.resolve.outputs.version }}
-      image_url:
-        description: "URL completa de la imagen GHCR"
-        value: ${{ jobs.resolve.outputs.image_url }}
+      images_json:
+        description: "Array de imágenes normalizadas (JSON)"
+        value: ${{ jobs.resolve.outputs.images_json }}
 
 permissions:
   contents: read
@@ -152,40 +210,100 @@ env:
 
 jobs:
   resolve:
-    name: Resolver ref + tag
+    name: Resolver ref, version, images
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.out.outputs.ref }}
       sha: ${{ steps.out.outputs.sha }}
       version: ${{ steps.out.outputs.version }}
       owner_lc: ${{ steps.out.outputs.owner_lc }}
-      image_url: ${{ steps.out.outputs.image_url }}
+      images_json: ${{ steps.out.outputs.images_json }}
+      migrate_service: ${{ steps.out.outputs.migrate_service }}
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.ref }}
           fetch-depth: 1
       - id: out
+        env:
+          INPUT_IMAGES_JSON: ${{ inputs.images_json }}
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+          INPUT_DOCKER_CONTEXT: ${{ inputs.docker_context }}
+          INPUT_SERVICE_NAME: ${{ inputs.service_name }}
+          INPUT_CONTAINER_NAME: ${{ inputs.container_name }}
+          INPUT_MIGRATE_SERVICE: ${{ inputs.migrate_service }}
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+          GH_REF_TYPE: ${{ github.ref_type }}
+          GH_REF_NAME: ${{ github.ref_name }}
         run: |
-          REF="${{ github.ref_name }}"
+          set -euo pipefail
+
+          REF="$GH_REF_NAME"
           SHA="$(git rev-parse --short HEAD)"
-          STAMP="$(date -u +%Y%m%d-%H%M%S)"
           OWNER_LC="$(echo '${{ env.IMAGE_OWNER }}' | tr '[:upper:]' '[:lower:]')"
-          VERSION="${STAMP}-${SHA}"
-          IMAGE_URL="${{ env.REGISTRY }}/${OWNER_LC}/${{ inputs.image_name }}:${VERSION}"
+
+          # ── Resolver VERSION ──
+          if [ -n "$INPUT_VERSION_OVERRIDE" ]; then
+            VERSION="$INPUT_VERSION_OVERRIDE"
+          elif [ "$GH_REF_TYPE" = "tag" ]; then
+            # Tag deploy → la versión es el tag exacto (ej. v1.45.0)
+            VERSION="$GH_REF_NAME"
+          else
+            # Push a rama o dispatch sin override → date-shortsha
+            VERSION="$(date -u +%Y%m%d-%H%M%S)-${SHA}"
+          fi
+
+          # ── Normalizar IMAGES ──
+          if [ -n "$INPUT_IMAGES_JSON" ]; then
+            # Multi-image: usar el JSON tal cual (validar con jq)
+            IMAGES=$(echo "$INPUT_IMAGES_JSON" | jq -c .)
+          else
+            # Single-image: construir el JSON desde los inputs singletons
+            if [ -z "$INPUT_IMAGE_NAME" ] || [ -z "$INPUT_CONTAINER_NAME" ]; then
+              echo "::error::Modo single-image requiere image_name y container_name (o pasar images_json para multi-image)"
+              exit 1
+            fi
+            IMAGES=$(jq -nc \
+              --arg img "$INPUT_IMAGE_NAME" \
+              --arg df "$INPUT_DOCKERFILE" \
+              --arg ctx "$INPUT_DOCKER_CONTEXT" \
+              --arg svc "$INPUT_SERVICE_NAME" \
+              --arg ctr "$INPUT_CONTAINER_NAME" \
+              '[{image_name: $img, dockerfile: $df, docker_context: $ctx, service_name: $svc, container_name: $ctr}]')
+          fi
+
+          # ── Resolver MIGRATE_SERVICE ──
+          if [ -n "$INPUT_MIGRATE_SERVICE" ]; then
+            MIGRATE_SVC="$INPUT_MIGRATE_SERVICE"
+          else
+            # Default: primer service del array
+            MIGRATE_SVC=$(echo "$IMAGES" | jq -r '.[0].service_name')
+          fi
+
           {
             echo "ref=$REF"
             echo "sha=$SHA"
             echo "version=$VERSION"
             echo "owner_lc=$OWNER_LC"
-            echo "image_url=$IMAGE_URL"
+            echo "images_json=$IMAGES"
+            echo "migrate_service=$MIGRATE_SVC"
           } >> "$GITHUB_OUTPUT"
 
-  build-image:
-    name: Build & push ${{ inputs.image_name }}
+          echo "── resumen ──"
+          echo "REF=$REF  SHA=$SHA  VERSION=$VERSION  OWNER=$OWNER_LC"
+          echo "MIGRATE_SVC=$MIGRATE_SVC"
+          echo "IMAGES=$IMAGES"
+
+  build-images:
+    name: Build & push ${{ matrix.img.image_name }}
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes_build }}
+    strategy:
+      fail-fast: true
+      matrix:
+        img: ${{ fromJSON(needs.resolve.outputs.images_json) }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -200,23 +318,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push
+      - name: Build & push ${{ matrix.img.image_name }}
         uses: docker/build-push-action@v7
         with:
-          context: ${{ inputs.docker_context }}
-          file: ${{ inputs.dockerfile }}
+          context: ${{ matrix.img.docker_context }}
+          file: ${{ matrix.img.dockerfile }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:${{ needs.resolve.outputs.version }}
-            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:latest
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ inputs.image_name }}:buildcache,mode=max
+            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:${{ needs.resolve.outputs.version }}
+            ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:buildcache,mode=max
           build-args: |
             APP_VERSION=${{ needs.resolve.outputs.version }}
 
   deploy:
     name: Deploy → VPS (${{ inputs.health_url }})
-    needs: [resolve, build-image]
+    needs: [resolve, build-images]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes_deploy }}
     environment:
@@ -275,7 +393,7 @@ jobs:
           ssh "$USER@$HOST" bash -se <<EOF
           set -euo pipefail
 
-          if [ ! -f "$ENV_VPS_PATH" ]; then
+          if [ ! -f "$ENV_VPS_PATH" ] && ! sudo test -f "$ENV_VPS_PATH"; then
             echo "::error::No existe $ENV_VPS_PATH en el VPS"
             rm -f /tmp/_env_validation_example
             exit 1
@@ -286,7 +404,7 @@ jobs:
           #         VAR=    → opcional (el example dice "define si quieres")
           REQUIRED_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=.+' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
           ALL_EXAMPLE_KEYS=\$(grep -E '^[A-Z_][A-Z0-9_]*=' /tmp/_env_validation_example | cut -d= -f1 | sort -u)
-          # Extraer keys del .env real (con sudo porque es 600)
+          # Extraer keys del .env real (con sudo porque típicamente es 600)
           ENV_KEYS=\$(sudo grep -E '^[A-Z_][A-Z0-9_]*=' "$ENV_VPS_PATH" | cut -d= -f1 | sort -u)
 
           # Vars REQUERIDAS en example pero NO en real → ERROR
@@ -315,7 +433,7 @@ jobs:
           fi
 
           # Vars en real pero no en example → solo informativo
-          EXTRA=\$(comm -13 <(echo "\$EXAMPLE_KEYS") <(echo "\$ENV_KEYS") || true)
+          EXTRA=\$(comm -13 <(echo "\$ALL_EXAMPLE_KEYS") <(echo "\$ENV_KEYS") || true)
           if [ -n "\$EXTRA" ]; then
             echo "::notice::Vars en $ENV_VPS_PATH no documentadas en $ENV_EXAMPLE (legacy o overrides locales):"
             echo "\$EXTRA" | sed 's/^/  - /'
@@ -331,159 +449,213 @@ jobs:
           HOST: ${{ secrets.PROD_HOST }}
           USER: ${{ secrets.PROD_USER }}
           VPS_PATH: ${{ inputs.vps_path }}
-          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGES_JSON: ${{ needs.resolve.outputs.images_json }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          # Tomar el image_name del primer image para nombrar el dir de backups.
+          # (En multi-image todos comparten una DB, así que un solo backup basta.)
+          BACKUP_KEY=$(echo "$IMAGES_JSON" | jq -r '.[0].image_name')
           ssh "$USER@$HOST" bash -se <<EOF
           set -euo pipefail
-          BACKUP_DIR="/srv/backups/${IMAGE_NAME}"
-          mkdir -p "\$BACKUP_DIR"
+          BACKUP_DIR="/srv/backups/${BACKUP_KEY}"
+          sudo mkdir -p "\$BACKUP_DIR"
           STAMP="\$(date -u +%Y%m%d-%H%M%S)"
           cd "${VPS_PATH}"
-          # Asume que el compose tiene el servicio "db" y que .env tiene POSTGRES_*
-          if docker compose -f compose.prod.yml ps db --format json 2>/dev/null | grep -q '"State":"running"'; then
-            docker compose -f compose.prod.yml exec -T db pg_dumpall -U "\${POSTGRES_USER:-postgres}" \
-              | gzip > "\$BACKUP_DIR/\${STAMP}.sql.gz"
-            echo "Backup en \$BACKUP_DIR/\${STAMP}.sql.gz"
-            # Retención 30 días
-            find "\$BACKUP_DIR" -name "*.sql.gz" -mtime +30 -delete
-          else
-            echo "::notice::Servicio db no está running en este stack, skip backup"
+
+          # Detectar servicio de DB. Acepta "db", "postgres", o si declarado en compose.
+          DB_SVC=""
+          for candidate in db postgres; do
+            if sudo docker compose -f compose.prod.yml ps "\$candidate" --format json 2>/dev/null | grep -q '"State":"running"'; then
+              DB_SVC="\$candidate"; break
+            fi
+          done
+
+          if [ -z "\$DB_SVC" ]; then
+            echo "::notice::No hay servicio db/postgres running en este stack, skip backup"
+            exit 0
           fi
+
+          OUT="\$BACKUP_DIR/pre-${VERSION}-\${STAMP}.sql.gz"
+          POSTGRES_USER=\$(sudo grep '^POSTGRES_USER=' .env | cut -d= -f2- || echo "postgres")
+          POSTGRES_DB=\$(sudo grep '^POSTGRES_DB=' .env | cut -d= -f2- || echo "")
+
+          if [ -n "\$POSTGRES_DB" ]; then
+            sudo docker compose -f compose.prod.yml exec -T "\$DB_SVC" \
+              pg_dump -U "\$POSTGRES_USER" "\$POSTGRES_DB" | gzip | sudo tee "\$OUT" > /dev/null
+          else
+            sudo docker compose -f compose.prod.yml exec -T "\$DB_SVC" \
+              pg_dumpall -U "\$POSTGRES_USER" | gzip | sudo tee "\$OUT" > /dev/null
+          fi
+
+          SIZE=\$(sudo stat -c%s "\$OUT")
+          echo "Backup escrito: \$OUT (\$SIZE bytes)"
+          if [ "\$SIZE" -lt 1024 ]; then
+            echo "::error::Backup vacío (\$SIZE bytes). Abortando deploy."
+            sudo rm -f "\$OUT"
+            exit 1
+          fi
+
+          # Retención 30 días
+          sudo find "\$BACKUP_DIR" -maxdepth 1 -name "*.sql.gz" -mtime +30 -delete 2>/dev/null || true
+          KEPT=\$(sudo find "\$BACKUP_DIR" -maxdepth 1 -name "*.sql.gz" | wc -l)
+          echo "Backups conservados: \$KEPT"
           EOF
 
-      - name: Pull imagen + (migrate) + deploy ${{ inputs.service_name }}
+      - name: Pull imágenes + (migrate) + up
         env:
           HOST: ${{ secrets.PROD_HOST }}
           USER: ${{ secrets.PROD_USER }}
-          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
-          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           VERSION_ENV_VAR: ${{ inputs.version_env_var }}
-          SERVICE: ${{ inputs.service_name }}
-          CONTAINER: ${{ inputs.container_name }}
+          IMAGES_JSON: ${{ needs.resolve.outputs.images_json }}
+          MIGRATE_SERVICE: ${{ needs.resolve.outputs.migrate_service }}
+          MIGRATE_COMMAND: ${{ inputs.migrate_command }}
+          RUN_MIGRATIONS: ${{ inputs.run_migrations }}
           VPS_PATH: ${{ inputs.vps_path }}
           COMPOSE_FILE: ${{ inputs.compose_file }}
           CHECK_NETWORK: ${{ inputs.check_hubwell_network }}
           KILL_HOST_PORTS: ${{ inputs.kill_host_ports }}
-          RUN_MIGRATIONS: ${{ inputs.run_migrations }}
           WAIT_MAX_SECONDS: ${{ inputs.wait_max_seconds }}
           WAIT_GRACE_PERIOD: ${{ inputs.wait_grace_period_seconds }}
         run: |
-          ssh "$USER@$HOST" bash -se <<EOF
+          # Extraer services y containers del JSON (space-separated) para el remoto.
+          SERVICES=$(echo "$IMAGES_JSON" | jq -r '[.[].service_name] | join(" ")')
+          CONTAINERS=$(echo "$IMAGES_JSON" | jq -r '[.[].container_name] | join(" ")')
+
+          ssh "$USER@$HOST" \
+            "GHCR_USER='$GHCR_USER' GHCR_TOKEN='$GHCR_TOKEN' VERSION='$VERSION' \
+             VERSION_ENV_VAR='$VERSION_ENV_VAR' SERVICES='$SERVICES' CONTAINERS='$CONTAINERS' \
+             MIGRATE_SERVICE='$MIGRATE_SERVICE' MIGRATE_COMMAND='$MIGRATE_COMMAND' \
+             RUN_MIGRATIONS='$RUN_MIGRATIONS' VPS_PATH='$VPS_PATH' COMPOSE_FILE='$COMPOSE_FILE' \
+             CHECK_NETWORK='$CHECK_NETWORK' KILL_HOST_PORTS='$KILL_HOST_PORTS' \
+             WAIT_MAX_SECONDS='$WAIT_MAX_SECONDS' WAIT_GRACE_PERIOD='$WAIT_GRACE_PERIOD' \
+             bash -se" <<'EOF'
           set -euo pipefail
           cd "${VPS_PATH}"
 
-          if [ ! -f .env ]; then
-            echo "::error::Falta ${VPS_PATH}/.env en el VPS (ver .env.prod.example)."
+          if ! sudo test -f .env; then
+            echo "::error::Falta ${VPS_PATH}/.env en el VPS"
             exit 1
           fi
 
           if [ "${CHECK_NETWORK}" = "true" ]; then
-            if ! docker network inspect hubwell_network >/dev/null 2>&1; then
+            if ! sudo docker network inspect hubwell_network >/dev/null 2>&1; then
               echo "::error::La red 'hubwell_network' no existe en el VPS."
               exit 1
             fi
           fi
 
-          echo "${GHCR_PULL_TOKEN}" | docker login ghcr.io -u "${GHCR_PULL_USER}" --password-stdin
+          echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${GHCR_USER}" --password-stdin
 
-          # Pre-up: matar containers fantasma que ocupen los host ports declarados.
-          # Necesario cuando un deploy previo dejó un container en restart loop con
-          # nombre distinto al actual (ej kario tras un crash + restart de docker).
-          # Acepta formatos "127.0.0.1:3004" o "3004" — extrae solo el puerto para el filter.
+          # Kill host port collisions
           if [ -n "${KILL_HOST_PORTS}" ]; then
             IFS=',' read -ra PORTS <<< "${KILL_HOST_PORTS}"
-            for port_spec in "\${PORTS[@]}"; do
-              port_spec=\$(echo "\$port_spec" | xargs)
-              # Extraer puerto numérico (después del último ":" o el spec entero)
-              port_num=\$(echo "\$port_spec" | rev | cut -d: -f1 | rev)
-              echo "▶ Verificando puerto \$port_num (spec: \$port_spec)..."
-
-              echo "  docker ps -a --filter publish=\$port_num:"
-              docker ps -a --filter "publish=\$port_num" --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}' || true
-
-              COLLIDING=\$(docker ps -aq --filter "publish=\$port_num" 2>/dev/null || true)
-              if [ -n "\$COLLIDING" ]; then
-                echo "::warning::Containers ocupando puerto \$port_num: \$COLLIDING — limpiando"
-                docker rm -f \$COLLIDING 2>&1 | sed 's/^/  /' || true
-              fi
-
-              # Si tras limpiar containers el puerto sigue ocupado, mostrar qué proceso lo tiene.
-              # No matamos procesos del host automáticamente (peligroso); solo informamos.
-              if command -v ss >/dev/null 2>&1; then
-                LISTENERS=\$(ss -tlnp 2>/dev/null | grep ":\$port_num " || true)
-                if [ -n "\$LISTENERS" ]; then
-                  echo "::warning::Puerto \$port_num sigue con listeners (no-docker?):"
-                  echo "\$LISTENERS" | sed 's/^/  /'
-                fi
+            for port_spec in "${PORTS[@]}"; do
+              port_spec=$(echo "$port_spec" | xargs)
+              port_num=$(echo "$port_spec" | rev | cut -d: -f1 | rev)
+              echo "▶ Verificando puerto $port_num..."
+              COLLIDING=$(sudo docker ps -aq --filter "publish=$port_num" 2>/dev/null || true)
+              if [ -n "$COLLIDING" ]; then
+                echo "::warning::Containers ocupando puerto $port_num: $COLLIDING — limpiando"
+                sudo docker rm -f $COLLIDING 2>&1 | sed 's/^/  /' || true
               fi
             done
           fi
 
           export ${VERSION_ENV_VAR}="${VERSION}"
-          docker compose -f "${COMPOSE_FILE}" pull "${SERVICE}"
 
+          # Pull todas las imágenes del array
+          sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" pull ${SERVICES}
+
+          # Migrations (en MIGRATE_SERVICE)
           if [ "${RUN_MIGRATIONS}" = "true" ]; then
-            echo "▶ Ejecutando prisma migrate deploy..."
-            docker compose -f "${COMPOSE_FILE}" run --rm "${SERVICE}" npx prisma migrate deploy || {
-              echo "::error::Migrate falló. NO se subirá la nueva imagen. Revisa backup en /srv/backups/."
+            echo "▶ Ejecutando migrations en service '${MIGRATE_SERVICE}': ${MIGRATE_COMMAND}"
+            sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" run --rm -T "${MIGRATE_SERVICE}" sh -c "${MIGRATE_COMMAND}" < /dev/null || {
+              echo "::error::Migrate falló. NO se subirán las nuevas imágenes."
               exit 1
             }
           fi
 
-          # Flags clave:
-          # --no-deps: NUNCA recrea otros services del compose (defensa explícita).
-          # --remove-orphans: limpia containers del MISMO project que ya no están en el compose.
-          # --force-recreate: fuerza recreación del service aunque el config no haya cambiado.
-          #   Necesario porque sin él, si un container previo entró en restart loop y quedó
-          #   ocupando puerto del host (ej kario:127.0.0.1:3004), el up nuevo falla con
-          #   "port is already allocated". --force-recreate lo detiene primero.
-          docker compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate --remove-orphans "${SERVICE}"
+          # Up de todos los servicios (--no-deps para no tocar postgres/redis/etc.)
+          sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate --remove-orphans ${SERVICES} < /dev/null
 
+          # Grace period
           if [ "${WAIT_GRACE_PERIOD}" -gt 0 ]; then
-            echo "Grace period inicial: ${WAIT_GRACE_PERIOD}s antes del primer check..."
+            echo "Grace period: ${WAIT_GRACE_PERIOD}s antes del primer check..."
             sleep "${WAIT_GRACE_PERIOD}"
           fi
 
-          MAX_ITER=\$(( ${WAIT_MAX_SECONDS} / 3 ))
-          for i in \$(seq 1 \$MAX_ITER); do
-            state=\$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo "missing")
-            health=\$(docker inspect -f '{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "no-healthcheck")
-            echo "wait[\$i/\$MAX_ITER] state=\$state health=\$health"
-            if [ "\$state" = "running" ] && { [ "\$health" = "healthy" ] || [ "\$health" = "no-healthcheck" ]; }; then
-              echo "✅ Container ${CONTAINER} healthy"
+          # Wait for ALL containers healthy
+          MAX_ITER=$(( ${WAIT_MAX_SECONDS} / 3 ))
+          for i in $(seq 1 $MAX_ITER); do
+            ALL_OK=true
+            STATUS_LINE=""
+            for c in ${CONTAINERS}; do
+              state=$(sudo docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo "missing")
+              health=$(sudo docker inspect -f '{{.State.Health.Status}}' "$c" 2>/dev/null || echo "no-healthcheck")
+              STATUS_LINE="${STATUS_LINE}  $c=$state/$health"
+              if [ "$state" != "running" ] || { [ "$health" != "healthy" ] && [ "$health" != "no-healthcheck" ]; }; then
+                ALL_OK=false
+              fi
+            done
+            echo "wait[$i/$MAX_ITER]${STATUS_LINE}"
+            if [ "$ALL_OK" = "true" ]; then
+              echo "✅ Todos los containers healthy"
               break
             fi
-            if [ "\$i" -eq "\$MAX_ITER" ]; then
-              echo "::error::Container ${CONTAINER} no llegó a healthy en ${WAIT_MAX_SECONDS}s"
-              echo "--- docker ps --filter name=${CONTAINER} ---"
-              docker ps -a --filter "name=${CONTAINER}" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.RunningFor}}'
-              echo "--- docker compose logs --tail=200 ---"
-              docker compose -f "${COMPOSE_FILE}" logs --tail=200 "${SERVICE}"
+            if [ "$i" -eq "$MAX_ITER" ]; then
+              echo "::error::Containers no llegaron a healthy en ${WAIT_MAX_SECONDS}s"
+              for c in ${CONTAINERS}; do
+                echo "--- logs de $c (últimas 100) ---"
+                sudo docker logs --tail 100 "$c" 2>&1 || true
+              done
               exit 1
             fi
             sleep 3
           done
 
-          docker image prune -f
+          sudo docker image prune -f
           EOF
 
       - name: Smoke test público
         if: ${{ inputs.smoke_test_mode == 'public' }}
         env:
           HEALTH_URL: ${{ inputs.health_url }}
+          EXTRA_URLS: ${{ inputs.smoke_urls }}
         run: |
           set -e
-          for i in 1 2 3 4 5 6; do
-            code=$(curl -fsS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
-            if echo "$code" | grep -q "^[23]"; then
-              echo "✅ $HEALTH_URL OK (HTTP $code)"; exit 0
+          # Construir lista: health_url + smoke_urls (coma-separadas)
+          URLS=("$HEALTH_URL")
+          if [ -n "$EXTRA_URLS" ]; then
+            IFS=',' read -ra EXTRAS <<< "$EXTRA_URLS"
+            for u in "${EXTRAS[@]}"; do
+              URLS+=("$(echo "$u" | xargs)")
+            done
+          fi
+
+          FAILED=()
+          for url in "${URLS[@]}"; do
+            ok=false
+            for i in 1 2 3 4 5 6; do
+              code=$(curl -fsS -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+              if echo "$code" | grep -q "^[23]"; then
+                echo "✅ $url OK (HTTP $code)"
+                ok=true; break
+              fi
+              echo "intento $i para $url: HTTP $code, reintentando..."
+              sleep 10
+            done
+            if [ "$ok" != "true" ]; then
+              FAILED+=("$url")
             fi
-            echo "intento $i: HTTP $code, reintentando..."
-            sleep 10
           done
-          echo "::error::$HEALTH_URL no responde con 2xx/3xx tras el deploy"
-          exit 1
+
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "::error::Smoke fallido en: ${FAILED[*]}"
+            exit 1
+          fi
 
       - name: Smoke test interno (red docker)
         if: ${{ inputs.smoke_test_mode == 'internal' }}
@@ -497,21 +669,22 @@ jobs:
             echo "::error::smoke_test_mode=internal requiere smoke_internal_url"
             exit 1
           fi
-          ssh "$USER@$HOST" "docker run --rm --network $NETWORK curlimages/curl:8.9.1 -fsS '$INTERNAL_URL'"
+          ssh "$USER@$HOST" "sudo docker run --rm --network $NETWORK curlimages/curl:8.9.1 -fsS '$INTERNAL_URL'"
 
       - name: Resumen
         if: always()
         env:
           STATUS: ${{ job.status }}
           VERSION: ${{ needs.resolve.outputs.version }}
-          IMAGE: ${{ needs.resolve.outputs.image_url }}
+          IMAGES_JSON: ${{ needs.resolve.outputs.images_json }}
           HEALTH: ${{ inputs.health_url }}
         run: |
           echo "## Deploy summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Status**: $STATUS" >> $GITHUB_STEP_SUMMARY
           echo "- **Version**: \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`$IMAGE\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Images**:" >> $GITHUB_STEP_SUMMARY
+          echo "$IMAGES_JSON" | jq -r '.[] | "  - `\(.image_name)` → service `\(.service_name)` → container `\(.container_name)`"' >> $GITHUB_STEP_SUMMARY
           echo "- **URL**: $HEALTH" >> $GITHUB_STEP_SUMMARY
 
   notify:
@@ -526,7 +699,7 @@ jobs:
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           STATUS: ${{ needs.deploy.result }}
           VERSION: ${{ needs.resolve.outputs.version }}
-          IMAGE: ${{ inputs.image_name }}
+          IMAGES_JSON: ${{ needs.resolve.outputs.images_json }}
           HEALTH: ${{ inputs.health_url }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -537,6 +710,8 @@ jobs:
             echo "Telegram secrets no configurados, skip notificación."
             exit 0
           fi
+          # Lista de imágenes para el mensaje
+          IMAGES_LIST=$(echo "$IMAGES_JSON" | jq -r '[.[].image_name] | join(", ")')
           if [ "$STATUS" = "success" ]; then
             EMOJI="🚀"
             STATUS_TEXT="✅ success"
@@ -544,7 +719,7 @@ jobs:
             EMOJI="🔥"
             STATUS_TEXT="❌ failed"
           fi
-          MSG="$EMOJI *Deploy ${IMAGE} → prod*%0A%0A*Version*: \`${VERSION}\`%0A*URL*: ${HEALTH}%0A*Status*: ${STATUS_TEXT}%0A*Por*: @${ACTOR}%0A%0A[Ver run](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+          MSG="$EMOJI *Deploy → prod*%0A%0A*Images*: ${IMAGES_LIST}%0A*Version*: \`${VERSION}\`%0A*URL*: ${HEALTH}%0A*Status*: ${STATUS_TEXT}%0A*Por*: @${ACTOR}%0A%0A[Ver run](https://github.com/${REPO}/actions/runs/${RUN_ID})"
           curl -fsS "https://api.telegram.org/bot${BOT}/sendMessage" \
             -d "chat_id=${CHAT}" \
             -d "parse_mode=Markdown" \
