@@ -48,10 +48,25 @@ on:
         description: |
           JSON array para multi-image. Si está vacío, se usa el modo single-image desde los inputs de arriba.
           Esquema por item: {image_name, dockerfile, docker_context, service_name, container_name}.
+          Cada item se buildea como matrix y su service_name/container_name se incluye en pull/up/wait.
           Ejemplo:
             [
-              {"image_name":"hubwell-api","dockerfile":"apps/api/Dockerfile","docker_context":"apps/api","service_name":"api","container_name":"hubwell_api_prod"},
+              {"image_name":"hubwell-api","dockerfile":"apps/api/Dockerfile","docker_context":"apps/api","service_name":"api-1","container_name":"hubwell_api_1_prod"},
               {"image_name":"hubwell-web","dockerfile":"apps/web/Dockerfile","docker_context":"apps/web","service_name":"web","container_name":"hubwell_web_prod"}
+            ]
+        required: false
+        default: ""
+        type: string
+
+      additional_services_json:
+        description: |
+          JSON array de servicios EXTRA que ya comparten imagen con alguno de images_json y se redespliegan pero NO se buildean.
+          Esquema por item: {service_name, container_name}.
+          Útil para stacks que tienen replicas/workers que reusan la imagen del API.
+          Ejemplo (hub): la imagen hubwell-api la usan api-1, api-2 y worker; api-1 va en images_json y api-2/worker aquí:
+            [
+              {"service_name":"api-2","container_name":"hubwell_api_2_prod"},
+              {"service_name":"worker","container_name":"hubwell_worker_prod"}
             ]
         required: false
         default: ""
@@ -219,6 +234,8 @@ jobs:
       owner_lc: ${{ steps.out.outputs.owner_lc }}
       images_json: ${{ steps.out.outputs.images_json }}
       migrate_service: ${{ steps.out.outputs.migrate_service }}
+      all_services: ${{ steps.out.outputs.all_services }}
+      all_containers: ${{ steps.out.outputs.all_containers }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -234,6 +251,7 @@ jobs:
           INPUT_CONTAINER_NAME: ${{ inputs.container_name }}
           INPUT_MIGRATE_SERVICE: ${{ inputs.migrate_service }}
           INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+          INPUT_ADDITIONAL_SERVICES_JSON: ${{ inputs.additional_services_json }}
           GH_REF_TYPE: ${{ github.ref_type }}
           GH_REF_NAME: ${{ github.ref_name }}
         run: |
@@ -281,6 +299,20 @@ jobs:
             MIGRATE_SVC=$(echo "$IMAGES" | jq -r '.[0].service_name')
           fi
 
+          # ── Resolver lista combinada de services/containers (images + additional) ──
+          PRIMARY_SVCS=$(echo "$IMAGES" | jq -r '[.[].service_name] | join(" ")')
+          PRIMARY_CTRS=$(echo "$IMAGES" | jq -r '[.[].container_name] | join(" ")')
+          if [ -n "$INPUT_ADDITIONAL_SERVICES_JSON" ]; then
+            EXTRA=$(echo "$INPUT_ADDITIONAL_SERVICES_JSON" | jq -c .)
+            EXTRA_SVCS=$(echo "$EXTRA" | jq -r '[.[].service_name] | join(" ")')
+            EXTRA_CTRS=$(echo "$EXTRA" | jq -r '[.[].container_name] | join(" ")')
+            ALL_SVCS="${PRIMARY_SVCS} ${EXTRA_SVCS}"
+            ALL_CTRS="${PRIMARY_CTRS} ${EXTRA_CTRS}"
+          else
+            ALL_SVCS="$PRIMARY_SVCS"
+            ALL_CTRS="$PRIMARY_CTRS"
+          fi
+
           {
             echo "ref=$REF"
             echo "sha=$SHA"
@@ -288,12 +320,16 @@ jobs:
             echo "owner_lc=$OWNER_LC"
             echo "images_json=$IMAGES"
             echo "migrate_service=$MIGRATE_SVC"
+            echo "all_services=$ALL_SVCS"
+            echo "all_containers=$ALL_CTRS"
           } >> "$GITHUB_OUTPUT"
 
           echo "── resumen ──"
           echo "REF=$REF  SHA=$SHA  VERSION=$VERSION  OWNER=$OWNER_LC"
           echo "MIGRATE_SVC=$MIGRATE_SVC"
           echo "IMAGES=$IMAGES"
+          echo "ALL_SVCS=$ALL_SVCS"
+          echo "ALL_CTRS=$ALL_CTRS"
 
   build-images:
     name: Build & push ${{ matrix.img.image_name }}
@@ -509,7 +545,8 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
           VERSION_ENV_VAR: ${{ inputs.version_env_var }}
-          IMAGES_JSON: ${{ needs.resolve.outputs.images_json }}
+          SERVICES: ${{ needs.resolve.outputs.all_services }}
+          CONTAINERS: ${{ needs.resolve.outputs.all_containers }}
           MIGRATE_SERVICE: ${{ needs.resolve.outputs.migrate_service }}
           MIGRATE_COMMAND: ${{ inputs.migrate_command }}
           RUN_MIGRATIONS: ${{ inputs.run_migrations }}
@@ -520,10 +557,6 @@ jobs:
           WAIT_MAX_SECONDS: ${{ inputs.wait_max_seconds }}
           WAIT_GRACE_PERIOD: ${{ inputs.wait_grace_period_seconds }}
         run: |
-          # Extraer services y containers del JSON (space-separated) para el remoto.
-          SERVICES=$(echo "$IMAGES_JSON" | jq -r '[.[].service_name] | join(" ")')
-          CONTAINERS=$(echo "$IMAGES_JSON" | jq -r '[.[].container_name] | join(" ")')
-
           ssh "$USER@$HOST" \
             "GHCR_USER='$GHCR_USER' GHCR_TOKEN='$GHCR_TOKEN' VERSION='$VERSION' \
              VERSION_ENV_VAR='$VERSION_ENV_VAR' SERVICES='$SERVICES' CONTAINERS='$CONTAINERS' \
