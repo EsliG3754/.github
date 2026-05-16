@@ -82,9 +82,19 @@ on:
         required: true
         type: string
       compose_file:
-        description: "Path al compose file (relativo al repo y al vps_path). Default: compose.prod.yml"
+        description: "Path al compose file relativo a vps_path EN EL VPS. Default: compose.prod.yml"
         required: false
         default: "compose.prod.yml"
+        type: string
+      compose_repo_path:
+        description: |
+          Path al compose file EN EL REPO (relativo a la raíz del repo).
+          Si vacío, se asume el mismo que compose_file.
+          Útil para monorepos donde el compose vive en un subdir distinto a vps_path.
+          Ejemplo: repo en root, dashboard/compose.prod.yml → vps_path=/srv/.../dashboard,
+                   compose_file=compose.prod.yml, compose_repo_path=dashboard/compose.prod.yml.
+        required: false
+        default: ""
         type: string
       check_hubwell_network:
         description: "Verificar que la red hubwell_network exista en el VPS"
@@ -397,10 +407,13 @@ jobs:
           USER: ${{ secrets.PROD_USER }}
           VPS_PATH: ${{ inputs.vps_path }}
           COMPOSE_FILE: ${{ inputs.compose_file }}
+          COMPOSE_REPO_PATH: ${{ inputs.compose_repo_path }}
         run: |
+          # Source en el repo: compose_repo_path si está, si no el mismo compose_file.
+          SOURCE="${COMPOSE_REPO_PATH:-$COMPOSE_FILE}"
           REMOTE_DIR="$VPS_PATH/$(dirname "$COMPOSE_FILE")"
           ssh "$USER@$HOST" "mkdir -p '$REMOTE_DIR'"
-          scp "$COMPOSE_FILE" "$USER@$HOST:$VPS_PATH/$COMPOSE_FILE"
+          scp "$SOURCE" "$USER@$HOST:$VPS_PATH/$COMPOSE_FILE"
 
       - name: Validar .env del VPS contra .env.prod.example
         if: ${{ inputs.validate_env }}
