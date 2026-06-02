@@ -106,10 +106,26 @@ on:
         required: false
         default: ""
         type: string
+      minio_bucket:
+        description: "Bucket S3/MinIO para subir trace/video (vacío = no subir artefactos)."
+        required: false
+        default: ""
+        type: string
+      minio_public_base:
+        description: "Base URL pública para alcanzar los objetos subidos (ej https://artifacts.logwell.mx)."
+        required: false
+        default: ""
+        type: string
     secrets:
       QA_TOKEN:
         required: false
       QA_INGEST_TOKEN:
+        required: false
+      MINIO_ENDPOINT:
+        required: false
+      MINIO_ACCESS_KEY:
+        required: false
+      MINIO_SECRET_KEY:
         required: false
       DATABASE_URL_TEST:
         required: false
@@ -247,6 +263,44 @@ jobs:
             ${{ inputs.working_directory }}/test-results/
           retention-days: 14
           if-no-files-found: ignore
+
+      - name: Subir artefactos (trace/video) a MinIO + reescribir URLs
+        if: ${{ always() && inputs.minio_bucket != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          BUCKET: ${{ inputs.minio_bucket }}
+          PUBLIC_BASE: ${{ inputs.minio_public_base }}
+          REPORT_PATH: test-results/results.json
+          REPO_NAME: ${{ inputs.ingest_repo != '' && inputs.ingest_repo || github.event.repository.name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$MINIO_ENDPOINT" ] || [ ! -d test-results ]; then
+            echo "::notice::sin MINIO_ENDPOINT o sin test-results — skip subida"; exit 0
+          fi
+          PREFIX="qa/${REPO_NAME}/${RUN_ID}"
+          # Subir todos los artefactos (trace.zip, video.webm, screenshots) al bucket.
+          aws s3 cp test-results/ "s3://${BUCKET}/${PREFIX}/" --recursive \
+            --endpoint-url "$MINIO_ENDPOINT" --only-show-errors || echo "::warning::fallo subida MinIO"
+          # Reescribir las rutas locales de attachments en el reporte → URLs públicas.
+          [ -f "$REPORT_PATH" ] && node -e '
+            const fs = require("fs");
+            const base = `${process.env.PUBLIC_BASE}/qa/${process.env.REPO_NAME}/${process.env.RUN_ID}`;
+            const rep = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const walk = (s) => {
+              for (const sp of s.specs ?? []) for (const t of sp.tests ?? []) for (const r of t.results ?? [])
+                for (const a of r.attachments ?? []) {
+                  if (!a.path) continue;
+                  const i = a.path.indexOf("test-results/");
+                  if (i >= 0) a.path = `${base}/${a.path.slice(i + "test-results/".length)}`;
+                }
+              for (const c of s.suites ?? []) walk(c);
+            };
+            (rep.suites ?? []).forEach(walk);
+            fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(rep));
+            console.log("attachments reescritos a", base);
+          '
 
       - name: Ingestar reporte al cockpit (NOC)
         if: ${{ always() && inputs.ingest_url != '' }}
