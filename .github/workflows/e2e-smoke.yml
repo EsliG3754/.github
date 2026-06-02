@@ -42,6 +42,11 @@ on:
         required: false
         default: "20"
         type: string
+      package_manager:
+        description: "npm o pnpm (define el cache de setup-node y el lockfile)."
+        required: false
+        default: "npm"
+        type: string
       build_command:
         description: "Comando de build (modo ephemeral)."
         required: false
@@ -73,7 +78,7 @@ on:
         default: ""
         type: string
       install_command:
-        description: "Instalación de deps."
+        description: "Instalación de deps (ej. 'npm ci' o 'pnpm install --frozen-lockfile')."
         required: false
         default: "npm ci"
         type: string
@@ -134,11 +139,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # pnpm debe instalarse ANTES de setup-node para que cache: pnpm funcione.
+      - name: Setup pnpm
+        if: ${{ inputs.package_manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
-          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+          cache: ${{ inputs.package_manager }}
+          cache-dependency-path: ${{ inputs.working_directory }}/${{ inputs.package_manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
 
       - name: Resolver base URL + env
         id: cfg
