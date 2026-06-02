@@ -96,8 +96,20 @@ on:
         required: false
         default: 20
         type: number
+      ingest_url:
+        description: "URL del cockpit para POSTear el reporte (ej https://noc.logwell.mx/api/qa/ingest). Vacío = no ingesta."
+        required: false
+        default: ""
+        type: string
+      ingest_repo:
+        description: "Nombre del repo a registrar en el cockpit (default: el nombre corto del repo)."
+        required: false
+        default: ""
+        type: string
     secrets:
       QA_TOKEN:
+        required: false
+      QA_INGEST_TOKEN:
         required: false
       DATABASE_URL_TEST:
         required: false
@@ -235,6 +247,35 @@ jobs:
             ${{ inputs.working_directory }}/test-results/
           retention-days: 14
           if-no-files-found: ignore
+
+      - name: Ingestar reporte al cockpit (NOC)
+        if: ${{ always() && inputs.ingest_url != '' }}
+        env:
+          INGEST_URL: ${{ inputs.ingest_url }}
+          INGEST_TOKEN: ${{ secrets.QA_INGEST_TOKEN }}
+          REPORT_PATH: test-results/results.json
+          REPO_NAME: ${{ inputs.ingest_repo != '' && inputs.ingest_repo || github.event.repository.name }}
+          BASE_URL: ${{ steps.cfg.outputs.base_url }}
+          TARGET: ${{ inputs.target }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$INGEST_TOKEN" ] || [ ! -f "$REPORT_PATH" ]; then
+            echo "::notice::sin QA_INGEST_TOKEN o sin $REPORT_PATH — skip ingesta"; exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const body = JSON.stringify({ report, meta: {
+              repo: process.env.REPO_NAME,
+              trigger: process.env.GITHUB_EVENT_NAME === "schedule" ? "SCHEDULE" : "DEPLOY",
+              target: process.env.TARGET === "url" ? "URL" : "EPHEMERAL",
+              baseUrl: process.env.BASE_URL, commitSha: process.env.SHA,
+            }});
+            fetch(process.env.INGEST_URL, { method: "POST", headers: {
+              "content-type": "application/json", authorization: "Bearer " + process.env.INGEST_TOKEN,
+            }, body }).then(async r => console.log("ingest", r.status, await r.text()))
+              .catch(e => console.log("ingest error (ignorado):", e.message));
+          '
 
       - name: Notificar Telegram en fallo
         if: ${{ failure() }}
