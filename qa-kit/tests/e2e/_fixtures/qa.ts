@@ -32,7 +32,7 @@ export type QaContext = {
 };
 
 export const test = base.extend<{ qa: QaContext }>({
-  qa: async ({}, use) => {
+  qa: async ({}, provide) => {
     const ctx: QaContext = {
       runId: RUN_ID,
       marker: "__qa__",
@@ -41,7 +41,7 @@ export const test = base.extend<{ qa: QaContext }>({
       email: (slug: string) => `qa+${slug}-${RUN_ID}@logwell.mx`,
       text: (text: string) => `__qa__ ${text}`,
     };
-    await use(ctx);
+    await provide(ctx);
   },
 });
 
