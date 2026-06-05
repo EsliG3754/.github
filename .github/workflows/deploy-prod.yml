@@ -152,6 +152,11 @@ on:
         required: false
         default: true
         type: boolean
+      forbid_db_services:
+        description: "GUARDRAIL: abortar el deploy SIN tocar nada si el compose declara un servicio Postgres. La BD debe ser EXTERNA (no gestionada por el deploy de apps). Recomendado true en stacks con BD externa."
+        required: false
+        default: false
+        type: boolean
 
       # ── Operacional ──
       kill_host_ports:
@@ -569,6 +574,7 @@ jobs:
           KILL_HOST_PORTS: ${{ inputs.kill_host_ports }}
           WAIT_MAX_SECONDS: ${{ inputs.wait_max_seconds }}
           WAIT_GRACE_PERIOD: ${{ inputs.wait_grace_period_seconds }}
+          FORBID_DB_SERVICES: ${{ inputs.forbid_db_services }}
         run: |
           ssh "$USER@$HOST" \
             "GHCR_USER='$GHCR_USER' GHCR_TOKEN='$GHCR_TOKEN' VERSION='$VERSION' \
@@ -577,6 +583,7 @@ jobs:
              RUN_MIGRATIONS='$RUN_MIGRATIONS' VPS_PATH='$VPS_PATH' COMPOSE_FILE='$COMPOSE_FILE' \
              CHECK_NETWORK='$CHECK_NETWORK' KILL_HOST_PORTS='$KILL_HOST_PORTS' \
              WAIT_MAX_SECONDS='$WAIT_MAX_SECONDS' WAIT_GRACE_PERIOD='$WAIT_GRACE_PERIOD' \
+             FORBID_DB_SERVICES='$FORBID_DB_SERVICES' \
              bash -se" <<'EOF'
           set -euo pipefail
           cd "${VPS_PATH}"
@@ -610,6 +617,21 @@ jobs:
             done
           fi
 
+          # Versión previa (para rollback si falla el health gate). El .env aún tiene
+          # la versión ANTERIOR — la persistencia de la nueva ocurre tras el up.
+          PREV_VERSION=$(sudo grep "^${VERSION_ENV_VAR}=" .env 2>/dev/null | head -1 | cut -d= -f2- || true)
+
+          # GUARDRAIL (forbid_db_services): la BD es EXTERNA; ningún deploy debe
+          # gestionar un Postgres. Abortar SIN tocar nada si el compose lo declara.
+          if [ "${FORBID_DB_SERVICES:-false}" = "true" ]; then
+            PG_SVC=$(sudo docker compose -f "${COMPOSE_FILE}" config --services 2>/dev/null | grep -iE 'postgres' || true)
+            if [ -n "${PG_SVC}" ]; then
+              echo "::error::GUARDRAIL forbid_db_services: el compose declara servicio(s) Postgres [${PG_SVC}]. La BD es EXTERNA y ningún deploy debe crearla/recrearla. Abortado SIN tocar nada."
+              exit 1
+            fi
+            echo "✅ Guardrail OK: el compose no gestiona ningún Postgres (BD externa)."
+          fi
+
           export ${VERSION_ENV_VAR}="${VERSION}"
 
           # Pull todas las imágenes del array
@@ -618,7 +640,7 @@ jobs:
           # Migrations (en MIGRATE_SERVICE)
           if [ "${RUN_MIGRATIONS}" = "true" ]; then
             echo "▶ Ejecutando migrations en service '${MIGRATE_SERVICE}': ${MIGRATE_COMMAND}"
-            sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" run --rm -T "${MIGRATE_SERVICE}" sh -c "${MIGRATE_COMMAND}" < /dev/null || {
+            sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" run --rm --no-deps -T "${MIGRATE_SERVICE}" sh -c "${MIGRATE_COMMAND}" < /dev/null || {
               echo "::error::Migrate falló. NO se subirán las nuevas imágenes."
               exit 1
             }
@@ -668,6 +690,17 @@ jobs:
                 echo "--- logs de $c (últimas 100) ---"
                 sudo docker logs --tail 100 "$c" 2>&1 || true
               done
+              # ROLLBACK automático a la versión previa (solo apps; --no-deps NO toca la BD).
+              if [ -n "${PREV_VERSION:-}" ] && [ "${PREV_VERSION}" != "${VERSION}" ]; then
+                echo "::warning::Health gate falló — ROLLBACK a ${VERSION_ENV_VAR}=${PREV_VERSION}"
+                export ${VERSION_ENV_VAR}="${PREV_VERSION}"
+                sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" pull ${SERVICES} 2>&1 | tail -3 || true
+                sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate ${SERVICES} < /dev/null 2>&1 | tail -5 || true
+                sudo sed -i "s|^${VERSION_ENV_VAR}=.*|${VERSION_ENV_VAR}=${PREV_VERSION}|" .env 2>/dev/null || true
+                echo "::error::Deploy falló el health gate; se hizo ROLLBACK a ${PREV_VERSION}. Revisar logs."
+              else
+                echo "::error::Deploy falló y no hay versión previa válida para rollback."
+              fi
               exit 1
             fi
             sleep 3
