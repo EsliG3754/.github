@@ -627,6 +627,17 @@ jobs:
           # Up de todos los servicios (--no-deps para no tocar postgres/redis/etc.)
           sudo --preserve-env=${VERSION_ENV_VAR} docker compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate --remove-orphans ${SERVICES} < /dev/null
 
+          # Persistir la versión desplegada en el .env del VPS. El `up` de arriba usa
+          # la versión vía el `export` (gana sobre el .env), pero si NO la escribimos
+          # aquí, el .env queda con el tag ANTERIOR y un `docker compose up` manual
+          # posterior (o un operador) revertiría prod a la versión vieja. Idempotente.
+          if sudo grep -q "^${VERSION_ENV_VAR}=" .env 2>/dev/null; then
+            sudo sed -i "s|^${VERSION_ENV_VAR}=.*|${VERSION_ENV_VAR}=${VERSION}|" .env
+          else
+            echo "${VERSION_ENV_VAR}=${VERSION}" | sudo tee -a .env >/dev/null
+          fi
+          echo "✅ ${VERSION_ENV_VAR}=${VERSION} persistido en ${VPS_PATH}/.env"
+
           # Grace period
           if [ "${WAIT_GRACE_PERIOD}" -gt 0 ]; then
             echo "Grace period: ${WAIT_GRACE_PERIOD}s antes del primer check..."
