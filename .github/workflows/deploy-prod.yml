@@ -221,6 +221,15 @@ on:
         required: false
       TELEGRAM_CHAT_ID:
         required: false
+      # PAT con read:packages para resolver paquetes privados de GitHub Packages
+      # publicados en OTRO repo de la org (p. ej. @eslimx/* desde
+      # ESLIMX/logwell_cotizaciones). El GITHUB_TOKEN automático solo lee paquetes
+      # del propio repo, así que para cross-repo privado hace falta este PAT.
+      # Opcional: si no se setea, el build cae al GITHUB_TOKEN (sirve para
+      # paquetes públicos o del mismo repo). Se consume como secret de BuildKit
+      # 'github_token' (ver el RUN --mount=type=secret,id=github_token del Dockerfile).
+      PACKAGES_READ_TOKEN:
+        required: false
     outputs:
       version:
         description: "Tag inmutable de la imagen desplegada"
@@ -382,6 +391,11 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:buildcache,mode=max
           build-args: |
             APP_VERSION=${{ needs.resolve.outputs.version }}
+          # Token para resolver paquetes privados de GitHub Packages durante
+          # `npm ci` en el Dockerfile (RUN --mount=type=secret,id=github_token).
+          # Usa el PAT cross-repo si se proveyó; si no, cae al GITHUB_TOKEN.
+          secrets: |
+            github_token=${{ secrets.PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
   deploy:
     name: Deploy → VPS (${{ inputs.health_url }})
