@@ -221,6 +221,11 @@ on:
         required: false
       TELEGRAM_CHAT_ID:
         required: false
+      GH_PACKAGES_TOKEN:
+        # PAT del usuario con read:packages para instalar los paquetes privados
+        # @eslig3754/* en el build (npm.pkg.github.com). Opcional: los repos sin
+        # paquetes privados lo dejan vacío y el build no lo usa.
+        required: false
     outputs:
       version:
         description: "Tag inmutable de la imagen desplegada"
@@ -380,6 +385,11 @@ jobs:
             ${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:latest
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ needs.resolve.outputs.owner_lc }}/${{ matrix.img.image_name }}:buildcache,mode=max
+          # Token para instalar paquetes PRIVADOS @eslig3754/* (npm.pkg.github.com).
+          # El Dockerfile lo lee con `--mount=type=secret,id=github_token`. Vacío
+          # para repos sin paquetes privados (no se usa). Llega por `secrets: inherit`.
+          secrets: |
+            github_token=${{ secrets.GH_PACKAGES_TOKEN }}
           build-args: |
             APP_VERSION=${{ needs.resolve.outputs.version }}
 
