@@ -1,0 +1,348 @@
+name: e2e-smoke (reusable)
+
+# Smoke E2E con Playwright. Dos modos:
+#
+#  • target=ephemeral → build + start de la app EN EL RUNNER (+ Postgres service
+#    opcional) y corre los specs @smoke contra localhost. Es el GATE pre-merge:
+#    un smoke roto bloquea el PR. Previene merges que rompen el camino dorado.
+#
+#  • target=url → corre los specs contra una URL ya existente (prod/staging).
+#    Manda el header de modo QA (x-logwell-qa) para que el backend suprima
+#    efectos externos. Se usa post-deploy (detecta+alerta) y desde el cron 24/7.
+#
+# Siempre sube playwright-report/ + test-results/ (trace+video) como artifact.
+# Notifica a Telegram en fallo si hay secrets.
+#
+# Convenciones que asume (ver QA.md): tests en tests/e2e/, tag @smoke, scripts
+# npm test:e2e:smoke. El repo debe tener playwright instalado como devDep.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "'ephemeral' (build+start en CI) o 'url' (probar URL existente)"
+        required: true
+        type: string
+      base_url:
+        description: "URL a probar en modo url (ej https://logwell.mx). Ignorado en ephemeral."
+        required: false
+        default: ""
+        type: string
+      app_port:
+        description: "Puerto donde escucha la app en modo ephemeral."
+        required: false
+        default: 3000
+        type: number
+      working_directory:
+        description: "Directorio de trabajo (monorepos)."
+        required: false
+        default: "."
+        type: string
+      node_version:
+        required: false
+        default: "20"
+        type: string
+      package_manager:
+        description: "npm o pnpm (define el cache de setup-node y el lockfile)."
+        required: false
+        default: "npm"
+        type: string
+      build_command:
+        description: "Comando de build (modo ephemeral)."
+        required: false
+        default: "npm run build"
+        type: string
+      start_command:
+        description: "Comando para arrancar la app en background (modo ephemeral)."
+        required: false
+        default: "npm run start"
+        type: string
+      grep:
+        description: "Filtro de tags Playwright. Default solo smoke."
+        required: false
+        default: "@smoke"
+        type: string
+      needs_postgres:
+        description: "Levantar un Postgres service y correr migrate/seed (modo ephemeral con DB)."
+        required: false
+        default: false
+        type: boolean
+      migrate_command:
+        description: "Comando de migración contra el Postgres del runner."
+        required: false
+        default: "npx prisma migrate deploy"
+        type: string
+      seed_command:
+        description: "Comando de seed (opcional)."
+        required: false
+        default: ""
+        type: string
+      install_command:
+        description: "Instalación de deps (ej. 'npm ci' o 'pnpm install --frozen-lockfile')."
+        required: false
+        default: "npm ci"
+        type: string
+      playwright_install:
+        description: "Instalación de browsers Playwright."
+        required: false
+        default: "npx playwright install --with-deps chromium"
+        type: string
+      extra_env:
+        description: "Env adicional para la app/tests, formato KEY=VALUE separado por saltos de línea."
+        required: false
+        default: ""
+        type: string
+      timeout_minutes:
+        required: false
+        default: 20
+        type: number
+      ingest_url:
+        description: "URL del cockpit para POSTear el reporte (ej https://noc.logwell.mx/api/qa/ingest). Vacío = no ingesta."
+        required: false
+        default: ""
+        type: string
+      ingest_repo:
+        description: "Nombre del repo a registrar en el cockpit (default: el nombre corto del repo)."
+        required: false
+        default: ""
+        type: string
+      minio_bucket:
+        description: "Bucket S3/MinIO para subir trace/video (vacío = no subir artefactos)."
+        required: false
+        default: ""
+        type: string
+      minio_public_base:
+        description: "Base URL pública para alcanzar los objetos subidos (ej https://artifacts.logwell.mx)."
+        required: false
+        default: ""
+        type: string
+    secrets:
+      QA_TOKEN:
+        required: false
+      QA_INGEST_TOKEN:
+        required: false
+      MINIO_ENDPOINT:
+        required: false
+      MINIO_ACCESS_KEY:
+        required: false
+      MINIO_SECRET_KEY:
+        required: false
+      DATABASE_URL_TEST:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E smoke (${{ inputs.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    # Postgres service para modo ephemeral con DB. Si needs_postgres=false el
+    # contenedor queda idle y nadie se conecta (costo despreciable). Creds de
+    # test efímeras — el runner se destruye al terminar.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qa
+          POSTGRES_PASSWORD: qa
+          POSTGRES_DB: qa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qa"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # pnpm debe instalarse ANTES de setup-node para que cache: pnpm funcione.
+      - name: Setup pnpm
+        if: ${{ inputs.package_manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+          cache-dependency-path: ${{ inputs.working_directory }}/${{ inputs.package_manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Resolver base URL + env
+        id: cfg
+        run: |
+          if [ "${{ inputs.target }}" = "ephemeral" ]; then
+            echo "base_url=http://127.0.0.1:${{ inputs.app_port }}" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "${{ inputs.base_url }}" ]; then
+              echo "::error::target=url requiere base_url"; exit 1
+            fi
+            echo "base_url=${{ inputs.base_url }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Escribir extra_env a $GITHUB_ENV
+        if: ${{ inputs.extra_env != '' }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "${{ inputs.extra_env }}"
+
+      - name: Instalar deps
+        run: ${{ inputs.install_command }}
+
+      - name: Instalar browsers Playwright
+        run: ${{ inputs.playwright_install }}
+
+      # ── Solo modo ephemeral: DB + build + start ──────────────────────────
+      - name: Migrar DB (ephemeral + needs_postgres)
+        if: ${{ inputs.target == 'ephemeral' && inputs.needs_postgres }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST || 'postgresql://qa:qa@127.0.0.1:5432/qa_test' }}
+        run: ${{ inputs.migrate_command }}
+
+      - name: Seed DB (ephemeral + needs_postgres + seed_command)
+        if: ${{ inputs.target == 'ephemeral' && inputs.needs_postgres && inputs.seed_command != '' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST || 'postgresql://qa:qa@127.0.0.1:5432/qa_test' }}
+        run: ${{ inputs.seed_command }}
+
+      - name: Build (ephemeral)
+        if: ${{ inputs.target == 'ephemeral' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST || 'postgresql://qa:qa@127.0.0.1:5432/qa_test' }}
+        run: ${{ inputs.build_command }}
+
+      - name: Start app en background (ephemeral)
+        if: ${{ inputs.target == 'ephemeral' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST || 'postgresql://qa:qa@127.0.0.1:5432/qa_test' }}
+          PORT: ${{ inputs.app_port }}
+          QA_TOKEN: ${{ secrets.QA_TOKEN }}
+        run: |
+          ${{ inputs.start_command }} &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Esperar a que la app responda (ephemeral)
+        if: ${{ inputs.target == 'ephemeral' }}
+        run: |
+          URL="${{ steps.cfg.outputs.base_url }}"
+          for i in $(seq 1 60); do
+            code=$(curl -fsS -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo 000)
+            if echo "$code" | grep -q "^[23]"; then echo "✅ app arriba ($code)"; exit 0; fi
+            echo "wait[$i/60] $URL → $code"; sleep 2
+          done
+          echo "::error::la app no respondió en $URL"; exit 1
+
+      # ── Correr Playwright (ambos modos) ──────────────────────────────────
+      - name: Playwright smoke
+        env:
+          E2E_BASE_URL: ${{ steps.cfg.outputs.base_url }}
+          E2E_QA_TOKEN: ${{ secrets.QA_TOKEN }}
+          E2E_TARGET: ${{ inputs.target }}
+          E2E_RUN_ID: ${{ github.run_id }}
+        run: npx playwright test --grep "${{ inputs.grep }}"
+
+      - name: Subir reporte + traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}-${{ inputs.target }}
+          path: |
+            ${{ inputs.working_directory }}/playwright-report/
+            ${{ inputs.working_directory }}/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Subir artefactos (trace/video) a MinIO + reescribir URLs
+        if: ${{ always() && inputs.minio_bucket != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          BUCKET: ${{ inputs.minio_bucket }}
+          PUBLIC_BASE: ${{ inputs.minio_public_base }}
+          REPORT_PATH: test-results/results.json
+          REPO_NAME: ${{ inputs.ingest_repo != '' && inputs.ingest_repo || github.event.repository.name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$MINIO_ENDPOINT" ] || [ ! -d test-results ]; then
+            echo "::notice::sin MINIO_ENDPOINT o sin test-results — skip subida"; exit 0
+          fi
+          PREFIX="qa/${REPO_NAME}/${RUN_ID}"
+          # Subir todos los artefactos (trace.zip, video.webm, screenshots) al bucket.
+          aws s3 cp test-results/ "s3://${BUCKET}/${PREFIX}/" --recursive \
+            --endpoint-url "$MINIO_ENDPOINT" --only-show-errors || echo "::warning::fallo subida MinIO"
+          # Reescribir las rutas locales de attachments en el reporte → URLs públicas.
+          [ -f "$REPORT_PATH" ] && node -e '
+            const fs = require("fs");
+            const base = `${process.env.PUBLIC_BASE}/qa/${process.env.REPO_NAME}/${process.env.RUN_ID}`;
+            const rep = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const walk = (s) => {
+              for (const sp of s.specs ?? []) for (const t of sp.tests ?? []) for (const r of t.results ?? [])
+                for (const a of r.attachments ?? []) {
+                  if (!a.path) continue;
+                  const i = a.path.indexOf("test-results/");
+                  if (i >= 0) a.path = `${base}/${a.path.slice(i + "test-results/".length)}`;
+                }
+              for (const c of s.suites ?? []) walk(c);
+            };
+            (rep.suites ?? []).forEach(walk);
+            fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(rep));
+            console.log("attachments reescritos a", base);
+          '
+
+      - name: Ingestar reporte al cockpit (NOC)
+        if: ${{ always() && inputs.ingest_url != '' }}
+        env:
+          INGEST_URL: ${{ inputs.ingest_url }}
+          INGEST_TOKEN: ${{ secrets.QA_INGEST_TOKEN }}
+          REPORT_PATH: test-results/results.json
+          REPO_NAME: ${{ inputs.ingest_repo != '' && inputs.ingest_repo || github.event.repository.name }}
+          BASE_URL: ${{ steps.cfg.outputs.base_url }}
+          TARGET: ${{ inputs.target }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$INGEST_TOKEN" ] || [ ! -f "$REPORT_PATH" ]; then
+            echo "::notice::sin QA_INGEST_TOKEN o sin $REPORT_PATH — skip ingesta"; exit 0
+          fi
+          node -e '
+            const fs = require("fs");
+            const report = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, "utf8"));
+            const body = JSON.stringify({ report, meta: {
+              repo: process.env.REPO_NAME,
+              trigger: process.env.GITHUB_EVENT_NAME === "schedule" ? "SCHEDULE" : "DEPLOY",
+              target: process.env.TARGET === "url" ? "URL" : "EPHEMERAL",
+              baseUrl: process.env.BASE_URL, commitSha: process.env.SHA,
+            }});
+            fetch(process.env.INGEST_URL, { method: "POST", headers: {
+              "content-type": "application/json", authorization: "Bearer " + process.env.INGEST_TOKEN,
+            }, body }).then(async r => console.log("ingest", r.status, await r.text()))
+              .catch(e => console.log("ingest error (ignorado):", e.message));
+          '
+
+      - name: Notificar Telegram en fallo
+        if: ${{ failure() }}
+        working-directory: .
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TARGET: ${{ inputs.target }}
+          URL: ${{ steps.cfg.outputs.base_url }}
+        run: |
+          [ -z "$BOT" ] || [ -z "$CHAT" ] && { echo "sin secrets Telegram, skip"; exit 0; }
+          MSG="🧪 *Smoke E2E FALLÓ* (${TARGET})%0A*Repo*: ${REPO}%0A*URL*: ${URL}%0A%0A[Ver run + trace](https://github.com/${REPO}/actions/runs/${RUN_ID})"
+          curl -fsS "https://api.telegram.org/bot${BOT}/sendMessage" \
+            -d "chat_id=${CHAT}" -d "parse_mode=Markdown" -d "text=${MSG}" > /dev/null || true
