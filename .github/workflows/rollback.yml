@@ -10,6 +10,11 @@ name: rollback (reusable)
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: "Etiqueta del runner (default ubuntu-latest; usar 'sandbox' para self-hosted)."
+        required: false
+        default: "ubuntu-latest"
+        type: string
       version:
         description: "Versión a desplegar. 'latest' = última, o un tag inmutable como '20260513-184500-abc1234'."
         required: true
@@ -66,7 +71,7 @@ permissions:
 jobs:
   rollback:
     name: Rollback → ${{ inputs.health_url }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 10
     environment:
       name: ${{ inputs.environment_name }}
@@ -161,7 +166,7 @@ jobs:
     name: Notificar Telegram
     needs: rollback
     if: always() && (success() || failure())
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     steps:
       - name: Send Telegram message
         env:
