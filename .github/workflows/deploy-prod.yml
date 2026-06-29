@@ -16,6 +16,13 @@ name: deploy-prod (reusable)
 on:
   workflow_call:
     inputs:
+      # Runner: por defecto GitHub-hosted; los callers con runner self-hosted
+      # (p.ej. label "sandbox") lo pasan para evitar el consumo de minutos.
+      runs_on:
+        description: "Etiqueta del runner (default ubuntu-latest; usar 'sandbox' para el runner self-hosted)."
+        required: false
+        default: "ubuntu-latest"
+        type: string
       # ── Single-image inputs (modo compat) ──
       image_name:
         description: "Nombre de la imagen GHCR para single-image (ej: logwellv2, hubwell-portal). Ignorado si images_json está definido."
@@ -246,7 +253,7 @@ env:
 jobs:
   resolve:
     name: Resolver ref, version, images
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     outputs:
       ref: ${{ steps.out.outputs.ref }}
       sha: ${{ steps.out.outputs.sha }}
@@ -354,7 +361,7 @@ jobs:
   build-images:
     name: Build & push ${{ matrix.img.image_name }}
     needs: resolve
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes_build }}
     strategy:
       fail-fast: true
@@ -396,7 +403,7 @@ jobs:
   deploy:
     name: Deploy → VPS (${{ inputs.health_url }})
     needs: [resolve, build-images]
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes_deploy }}
     environment:
       name: ${{ inputs.environment_name }}
@@ -791,7 +798,7 @@ jobs:
     name: Notificar Telegram
     needs: [resolve, deploy]
     if: always() && (success() || failure())
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     steps:
       - name: Send Telegram message
         env:
