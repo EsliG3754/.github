@@ -95,8 +95,8 @@ jobs:
         env:
           HOST: ${{ secrets.PROD_HOST }}
           USER: ${{ secrets.PROD_USER }}
-          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
-          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+          GHCR_PULL_USER: ${{ github.actor }}
+          GHCR_PULL_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
           VERSION_ENV_VAR: ${{ inputs.version_env_var }}
           SERVICE: ${{ inputs.service_name }}
