@@ -1,0 +1,164 @@
+name: E2E smoke (reusable)
+
+# Workflow reutilizable de smoke E2E con Playwright. Estándar: QA.md.
+# Lo llaman los repos de producto (logwellv2, etc.) en dos modos:
+#
+#   target: url        → corre contra una URL real (prod/staging). El runner
+#                        manda el header x-logwell-qa (secret QA_TOKEN) para
+#                        que el backend suprima efectos externos (correo real).
+#   target: ephemeral  → build + start de la app en el runner y corre contra
+#                        localhost (gate de PR, sin claves externas).
+#
+# El caller usa `secrets: inherit`. Secrets que consume (todos opcionales):
+#   QA_TOKEN            → header x-logwell-qa (modo QA del backend)
+#   TELEGRAM_BOT_TOKEN  → alerta al fallar contra URL real
+#   TELEGRAM_CHAT_ID    → chat destino de la alerta
+#   E2E_BASIC_AUTH_USER / E2E_BASIC_AUTH_PASS → basic_auth de staging.*
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "url | ephemeral"
+        required: true
+        type: string
+      base_url:
+        description: "URL a probar (solo target: url)"
+        required: false
+        type: string
+        default: ""
+      grep:
+        description: "Filtro de pruebas (--grep de Playwright)"
+        required: false
+        type: string
+        default: "@smoke"
+      app_port:
+        description: "Puerto local de la app (solo target: ephemeral)"
+        required: false
+        type: number
+        default: 3000
+      build_command:
+        description: "Comando de build (solo target: ephemeral)"
+        required: false
+        type: string
+        default: "npm run build"
+      start_command:
+        description: "Comando de start (solo target: ephemeral)"
+        required: false
+        type: string
+        default: "npm run start"
+      needs_postgres:
+        description: "Levanta un Postgres efímero en :5432 (apps con DB)"
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: "Versión de Node"
+        required: false
+        type: string
+        default: "22"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      E2E_TARGET: ${{ inputs.target }}
+      E2E_RUN_ID: ${{ github.run_id }}
+      E2E_QA_TOKEN: ${{ secrets.QA_TOKEN }}
+      E2E_BASIC_AUTH_USER: ${{ secrets.E2E_BASIC_AUTH_USER }}
+      E2E_BASIC_AUTH_PASS: ${{ secrets.E2E_BASIC_AUTH_PASS }}
+    steps:
+      - name: Checkout (repo caller)
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # Cache de browsers: el download de Chromium (~150MB) es lo más caro
+      # del run; con cache el smoke queda en ~2 min.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Instalar Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Deps de sistema de Chromium (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Postgres efímero
+        if: ${{ inputs.needs_postgres }}
+        run: |
+          docker run -d --name e2e-pg -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres -e POSTGRES_DB=app \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            docker exec e2e-pg pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Build (ephemeral)
+        if: ${{ inputs.target == 'ephemeral' }}
+        run: ${{ inputs.build_command }}
+
+      - name: Start app (ephemeral)
+        if: ${{ inputs.target == 'ephemeral' }}
+        run: |
+          nohup ${{ inputs.start_command }} > /tmp/app.log 2>&1 &
+          echo "Esperando app en :${{ inputs.app_port }}..."
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://127.0.0.1:${{ inputs.app_port }}"; then
+              echo "App arriba."; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::La app no respondió en :${{ inputs.app_port }}"
+          tail -80 /tmp/app.log || true
+          exit 1
+
+      - name: Smoke (Playwright)
+        env:
+          E2E_BASE_URL: ${{ inputs.target == 'url' && inputs.base_url || format('http://127.0.0.1:{0}', inputs.app_port) }}
+        run: npx playwright test --grep "${{ inputs.grep }}"
+
+      - name: Log del server al fallar (ephemeral)
+        if: ${{ failure() && inputs.target == 'ephemeral' }}
+        run: tail -120 /tmp/app.log || true
+
+      - name: Subir reporte
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Alerta Telegram (URL real)
+        if: ${{ failure() && inputs.target == 'url' }}
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "Sin TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID; alerta omitida."
+            exit 0
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode chat_id="$TG_CHAT" \
+            --data-urlencode text="🔴 E2E smoke FALLÓ · ${{ inputs.base_url }} · ${{ github.repository }} · ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /dev/null || true
