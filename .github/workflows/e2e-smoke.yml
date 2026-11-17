@@ -60,7 +60,11 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    # Fijo en 24.04: el 2026-11-17 `ubuntu-latest` pasó a 26.04 y Playwright
+    # todavía no publica Chromium para esa versión («Playwright does not support
+    # chromium on ubuntu26.04-x64»); el smoke de producción salía rojo sin que
+    # nada estuviera roto. Volver a `ubuntu-latest` cuando Playwright la soporte.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       E2E_TARGET: ${{ inputs.target }}
